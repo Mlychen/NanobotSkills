@@ -25,9 +25,9 @@ This repository stores local skills for AI coding agents (for example, Codex age
 
 ## Path Conventions
 
-- The `todo-txt` skill uses fixed files:
-- `~/.nanobot/workspace/todo.txt`
-- `~/.nanobot/workspace/done.txt`
+- Keep path conventions skill-specific.
+- Define concrete file paths inside each skill's `SKILL.md`.
+- Treat this README as global guidance only.
 
 ## Skill Folder Naming Convention
 
