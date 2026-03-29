@@ -22,9 +22,7 @@ from models import (  # noqa: E402
     ThreadPlanTime,
     ThreadRecord,
 )
-from store import TimelineStore, safe_filename  # noqa: E402
-
-
+from store import TimelineStore  # noqa: E402
 logging.basicConfig(level=logging.WARNING)
 
 TIMELINE_META_KEY = "_timeline_memory"
@@ -53,10 +51,6 @@ def derive_thread_id(turn_id: str) -> str:
     return f"thr_{turn_id.encode('utf-8').hex()}"
 
 
-def derive_legacy_thread_id(turn_id: str) -> str:
-    return f"thr_{safe_filename(turn_id)}"
-
-
 def resolve_effective_source(turn_input: ProjectTurnInput) -> str:
     return turn_input.context.source or DEFAULT_SOURCE
 
@@ -70,9 +64,7 @@ def resolve_thread_id(turn_input: ProjectTurnInput) -> str | None:
 def resolve_replay_thread_ids(turn_input: ProjectTurnInput) -> set[str | None]:
     if turn_input.thread is None:
         return {None}
-    if turn_input.thread.thread_id:
-        return {turn_input.thread.thread_id}
-    return {derive_thread_id(turn_input.turn_id), derive_legacy_thread_id(turn_input.turn_id)}
+    return {resolve_thread_id(turn_input)}
 
 
 def build_event_id(turn_id: str, role: str) -> str:
@@ -143,7 +135,6 @@ def merge_event_refs(
         )
     return merged
 
-
 def build_thread_record(
     *,
     turn_input: ProjectTurnInput,
@@ -183,16 +174,16 @@ def build_thread_record(
 
 def ensure_replay_metadata_matches(
     *,
+    turn_input: ProjectTurnInput,
     record: RawEventRecord,
-    turn_id: str,
     fingerprint: str,
     role: str,
 ) -> str | None:
     meta = extract_timeline_meta(record)
-    if meta.get("turn_id") != turn_id:
-        raise ValueError(f"turn_id conflict: raw event {record.event_id} does not belong to {turn_id}")
+    if meta.get("turn_id") != turn_input.turn_id:
+        raise ValueError(f"turn_id conflict: raw event {record.event_id} does not belong to {turn_input.turn_id}")
     if meta.get("fingerprint") != fingerprint:
-        raise ValueError(f"turn_id conflict: different payload already recorded for {turn_id}")
+        raise ValueError(f"turn_id conflict: different payload already recorded for {turn_input.turn_id}")
     if meta.get("role") != role:
         raise ValueError(f"turn_id conflict: raw event {record.event_id} has unexpected role metadata")
     thread_id = meta.get("thread_id")
@@ -225,7 +216,6 @@ def build_raw_event(
                 thread_id=thread_id,
             ),
             schema_version=1,
-            created_at=recorded_at,
         )
     if turn_input.assistant_text is None:
         raise ValueError("assistant_text is required for outbound events")
@@ -245,7 +235,6 @@ def build_raw_event(
             thread_id=thread_id,
         ),
         schema_version=1,
-        created_at=recorded_at,
     )
 
 
@@ -265,8 +254,8 @@ def replay_result(store: TimelineStore, turn_input: ProjectTurnInput) -> dict[st
         raise ValueError(f"turn_id conflict: partial write detected for {turn_input.turn_id} (unexpected outbound)")
 
     thread_id = ensure_replay_metadata_matches(
+        turn_input=turn_input,
         record=inbound,
-        turn_id=turn_input.turn_id,
         fingerprint=fingerprint,
         role="inbound",
     )
@@ -276,8 +265,8 @@ def replay_result(store: TimelineStore, turn_input: ProjectTurnInput) -> dict[st
     needs_repair = False
     if outbound is not None:
         outbound_thread_id = ensure_replay_metadata_matches(
+            turn_input=turn_input,
             record=outbound,
-            turn_id=turn_input.turn_id,
             fingerprint=fingerprint,
             role="outbound",
         )
@@ -382,7 +371,7 @@ def cmd_project_turn(args: argparse.Namespace) -> int:
                 thread_id=recovery_thread_id,
                 recorded_at=recorded_at,
                 event_ids=recorded_ids,
-                current=current_thread,
+                current=None,
                 source=effective_source,
             )
             thread_payload = store.upsert_thread(thread_record).to_dict()
@@ -391,7 +380,7 @@ def cmd_project_turn(args: argparse.Namespace) -> int:
         replay["thread"] = thread_payload
         return emit_json(replay)
 
-    recorded_at = turn_input.context.recorded_at or now_iso()
+    recorded_at = now_iso()
     inbound_event = build_raw_event(
         turn_input=turn_input,
         role="inbound",

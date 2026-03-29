@@ -6,6 +6,7 @@ import re
 from pathlib import Path
 
 from models import RawEventRecord, ThreadMeta, ThreadRecord
+from time_utils import timestamp_sort_key
 
 
 logger = logging.getLogger(__name__)
@@ -17,25 +18,13 @@ def ensure_dir(path: Path) -> Path:
     return path
 
 
-def safe_filename(value: str) -> str:
-    return re.sub(r"[^A-Za-z0-9._-]+", "_", value).strip("._") or "item"
-
-
 def encode_thread_storage_key(thread_id: str) -> str:
     encoded = thread_id.encode("utf-8").hex()
     return f"{THREAD_STORAGE_PREFIX}{encoded}"
 
 
-def is_canonical_thread_path(path: Path) -> bool:
+def is_thread_storage_path(path: Path) -> bool:
     return re.fullmatch(rf"{re.escape(THREAD_STORAGE_PREFIX)}[0-9a-f]+", path.stem) is not None
-
-
-def classify_thread_snapshot_path(path: Path, *, thread_id: str) -> str | None:
-    if path.name == f"{encode_thread_storage_key(thread_id)}.json":
-        return "canonical"
-    if path.name == f"{safe_filename(thread_id)}.json":
-        return "legacy"
-    return None
 
 
 def iter_jsonl(path: Path):
@@ -53,7 +42,6 @@ def iter_jsonl(path: Path):
                 logger.warning("Skipping non-object JSONL line %s in %s", line_no, path)
                 continue
             yield payload
-
 
 class RawEventStore:
     def __init__(self, store_root: Path):
@@ -76,8 +64,7 @@ class RawEventStore:
             try:
                 return RawEventRecord.from_dict(payload)
             except (KeyError, TypeError, ValueError) as exc:
-                logger.warning("Invalid raw event %s in %s: %s", event_id, self.path, exc)
-                return None
+                raise ValueError(f"failed to load raw event: {event_id}") from exc
         return None
 
 
@@ -93,34 +80,23 @@ class ThreadHistoryStore:
     def list_thread_history(self, thread_id: str) -> list[ThreadRecord]:
         path = self.path_for(thread_id)
         if path.exists():
-            return self._load_history(path, thread_id=thread_id, legacy=False)
-
-        legacy_path = self.legacy_path_for(thread_id)
-        if legacy_path.exists():
-            return self._load_history(legacy_path, thread_id=thread_id, legacy=True)
-
+            return self._load_history(path, thread_id=thread_id)
         return []
 
     def path_for(self, thread_id: str) -> Path:
         return self.history_dir / f"{encode_thread_storage_key(thread_id)}.jsonl"
 
-    def legacy_path_for(self, thread_id: str) -> Path:
-        return self.history_dir / f"{safe_filename(thread_id)}.jsonl"
-
-    def _load_history(self, path: Path, *, thread_id: str, legacy: bool) -> list[ThreadRecord]:
+    def _load_history(self, path: Path, *, thread_id: str) -> list[ThreadRecord]:
         records: list[ThreadRecord] = []
         for payload in iter_jsonl(path):
             try:
                 records.append(ThreadRecord.from_dict(payload))
             except (KeyError, TypeError, ValueError) as exc:
-                logger.warning("Invalid thread history entry for %s in %s: %s", thread_id, path, exc)
+                raise ValueError(f"failed to load thread history: {path.name}") from exc
 
         mismatched = sorted({record.thread_id for record in records if record.thread_id != thread_id})
         if mismatched:
-            path_kind = "legacy" if legacy else "canonical"
-            raise ValueError(
-                f"{path_kind} thread history path collision: {path.name} mixes {', '.join(mismatched)} with {thread_id}"
-            )
+            raise ValueError(f"thread history path mismatch: {path.name} mixes {', '.join(mismatched)} with {thread_id}")
 
         return records
 
@@ -134,25 +110,20 @@ class ThreadStore:
     def get_thread(self, thread_id: str) -> ThreadRecord | None:
         path = self.path_for(thread_id)
         if path.exists():
-            return self._load_thread(path, thread_id=thread_id, legacy=False)
-
-        legacy_path = self.legacy_path_for(thread_id)
-        if legacy_path.exists():
-            return self._load_thread(legacy_path, thread_id=thread_id, legacy=True)
-
+            return self._load_thread(path, thread_id=thread_id)
         return None
 
-    def _load_thread(self, path: Path, *, thread_id: str, legacy: bool) -> ThreadRecord | None:
+    def _load_thread(self, path: Path, *, thread_id: str) -> ThreadRecord | None:
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(payload, dict):
+                raise ValueError("thread snapshot must be a JSON object")
             record = ThreadRecord.from_dict(payload)
         except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
-            logger.warning("Failed to load thread %s from %s: %s", thread_id, path, exc)
-            return None
+            raise ValueError(f"failed to load thread snapshot: {path.name}") from exc
 
         if record.thread_id != thread_id:
-            path_kind = "legacy" if legacy else "canonical"
-            raise ValueError(f"{path_kind} thread path collision: {path.name} stores {record.thread_id}, not {thread_id}")
+            raise ValueError(f"thread snapshot path mismatch: {path.name} stores {record.thread_id}, not {thread_id}")
         return record
 
     def upsert_thread(self, record: ThreadRecord) -> ThreadRecord:
@@ -167,30 +138,27 @@ class ThreadStore:
         return normalized
 
     def list_threads(self, thread_kind: str | None = None, status: str | None = None) -> list[ThreadRecord]:
-        records_by_id: dict[str, tuple[int, ThreadRecord]] = {}
-        paths = sorted(self.threads_dir.glob("*.json"), key=lambda path: (not is_canonical_thread_path(path), path.name))
+        records: list[ThreadRecord] = []
+        paths = sorted(path for path in self.threads_dir.glob("*.json") if is_thread_storage_path(path))
         for path in paths:
             try:
                 payload = json.loads(path.read_text(encoding="utf-8"))
+                if not isinstance(payload, dict):
+                    raise ValueError("thread snapshot must be a JSON object")
                 record = ThreadRecord.from_dict(payload)
             except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
-                logger.warning("Skipping invalid thread snapshot %s: %s", path, exc)
+                raise ValueError(f"failed to load thread snapshot: {path.name}") from exc
+            expected_name = f"{encode_thread_storage_key(record.thread_id)}.json"
+            if path.name != expected_name:
+                raise ValueError(f"thread snapshot path mismatch: {path.name} stores {record.thread_id}")
+            if thread_kind is not None and record.thread_kind != thread_kind:
                 continue
-            path_kind = classify_thread_snapshot_path(path, thread_id=record.thread_id)
-            if path_kind is None:
-                logger.warning("Skipping unsupported thread snapshot %s for thread_id %s", path, record.thread_id)
+            if status is not None and record.status != status:
                 continue
-            if thread_kind and record.thread_kind != thread_kind:
-                continue
-            if status and record.status != status:
-                continue
-            priority = 0 if path_kind == "canonical" else 1
-            existing = records_by_id.get(record.thread_id)
-            if existing is None or priority < existing[0]:
-                records_by_id[record.thread_id] = (priority, record)
+            records.append(record)
         return sorted(
-            (item[1] for item in records_by_id.values()),
-            key=lambda item: (item.last_event_at or "", item.updated_at),
+            records,
+            key=lambda item: (timestamp_sort_key(item.last_event_at), timestamp_sort_key(item.updated_at)),
             reverse=True,
         )
 
@@ -232,9 +200,6 @@ class ThreadStore:
 
     def path_for(self, thread_id: str) -> Path:
         return self.threads_dir / f"{encode_thread_storage_key(thread_id)}.json"
-
-    def legacy_path_for(self, thread_id: str) -> Path:
-        return self.threads_dir / f"{safe_filename(thread_id)}.json"
 
 
 class TimelineStore:

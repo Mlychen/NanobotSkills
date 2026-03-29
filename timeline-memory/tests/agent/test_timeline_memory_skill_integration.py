@@ -122,7 +122,6 @@ def test_host_adapter_e2e_write_and_read_contract(repo_root: Path, scratch_root:
         "user_text": "记录一次宿主调用。",
         "assistant_text": "已记录。",
         "thread": {"thread_id": "thr_host_1", "title": "host-thread", "status": "planned"},
-        "context": {"recorded_at": "2026-03-24T18:00:00+08:00"},
     }
 
     created = adapter.invoke_json("project-turn", store_root=store_root, payload=payload)

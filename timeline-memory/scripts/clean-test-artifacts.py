@@ -57,7 +57,7 @@ def main(argv: list[str] | None = None) -> int:
         report_only.append(f"tmp root does not exist: {tmp_root}")
 
     for path in sorted(ROOT.glob("pytest-cache-files-*")):
-        report_only.append(f"legacy pytest temp (report-only): {path}")
+        report_only.append(f"historical pytest temp (report-only): {path}")
 
     print(f"[clean-test-artifacts] tmp_root={tmp_root}")
     print(f"[clean-test-artifacts] cleaned={len(cleaned)} denied={len(denied)} report_only={len(report_only)}")

@@ -9,6 +9,8 @@
 - `list-threads`
 - `list-thread-history`
 
+使用时让 `--store-root` 指向一个新的 timeline 存储目录。
+
 ### `project-turn`
 
 用途：
@@ -77,7 +79,6 @@
 `context` 允许字段：
 
 - `source`
-- `recorded_at`
 - `actor_id`
 - `assistant_actor_id`
 
@@ -104,6 +105,7 @@
 - 有 `assistant_text` 时写两条 raw event；没有则只写 inbound
 - 有 `thread` 时执行 upsert；没有则不改 thread 快照
 - 内部 event id 由 `turn_id` 派生，例如 `<turn_id>:in`、`<turn_id>:out`
+- `recorded_at` 始终由系统在写入时生成，调用方不能指定
 - 重放请求不得新增 raw event、不得增加 revision
 - 但如果检测到同一 `turn_id` 的可恢复 partial write，允许在重试时补齐缺失的 outbound event 或 thread snapshot
 - 如果省略 `thread.thread_id`，系统会基于 `turn_id` 派生稳定且无碰撞的默认 thread ID
@@ -117,10 +119,6 @@
 输出：
 
 - 单个 thread JSON 或 `null`
-
-额外约束：
-
-- 如果命中 legacy 文件名碰撞，必须显式报错，不能返回错误 thread
 
 ### `list-threads`
 
@@ -143,17 +141,13 @@
 
 - 历史 thread 快照数组
 
-额外约束：
-
-- 如果命中 legacy 文件名碰撞，必须显式报错，不能混入其他 thread 的历史
-
 ## Internal Storage Model
 
 内部存储布局保持不变，但不再是 agent-facing contract：
 
 - `raw_events.jsonl`
-- `threads/<thread_id>.json`
-- `thread_history/<thread_id>.jsonl`
+- `threads/tid_<thread_id_utf8_hex>.json`
+- `thread_history/tid_<thread_id_utf8_hex>.jsonl`
 
 ### RawEventRecord
 
@@ -169,7 +163,6 @@
 - `payload`
 - `confidence`
 - `schema_version`
-- `created_at`
 
 约束：
 

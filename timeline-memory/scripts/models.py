@@ -60,7 +60,6 @@ class RawEventRecord:
     payload: dict[str, Any] = field(default_factory=dict)
     confidence: float | None = None
     schema_version: int = 1
-    created_at: str = ""
 
     def __post_init__(self) -> None:
         if not self.event_id:
@@ -73,8 +72,6 @@ class RawEventRecord:
             raise ValueError("source is required")
         if not self.actor_kind:
             raise ValueError("actor_kind is required")
-        if not self.created_at:
-            raise ValueError("created_at is required")
         self.payload = require_mapping(self.payload, "payload")
         ensure_no_standardized_time_fields(self.payload)
 
@@ -83,20 +80,20 @@ class RawEventRecord:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "RawEventRecord":
+        payload = require_mapping(data, "raw event")
         return cls(
-            event_id=str(data["event_id"]),
-            event_type=str(data["event_type"]),
-            recorded_at=str(data["recorded_at"]),
-            source=str(data["source"]),
-            actor_kind=str(data["actor_kind"]),
-            actor_id=str(data["actor_id"]) if data.get("actor_id") is not None else None,
-            correlation_id=str(data["correlation_id"]) if data.get("correlation_id") is not None else None,
-            causation_id=str(data["causation_id"]) if data.get("causation_id") is not None else None,
-            raw_text=str(data["raw_text"]) if data.get("raw_text") is not None else None,
-            payload=require_mapping(data.get("payload", {}), "payload"),
-            confidence=float(data["confidence"]) if data.get("confidence") is not None else None,
-            schema_version=int(data.get("schema_version", 1)),
-            created_at=str(data["created_at"]),
+            event_id=str(payload["event_id"]),
+            event_type=str(payload["event_type"]),
+            recorded_at=str(payload["recorded_at"]),
+            source=str(payload["source"]),
+            actor_kind=str(payload["actor_kind"]),
+            actor_id=str(payload["actor_id"]) if payload.get("actor_id") is not None else None,
+            correlation_id=str(payload["correlation_id"]) if payload.get("correlation_id") is not None else None,
+            causation_id=str(payload["causation_id"]) if payload.get("causation_id") is not None else None,
+            raw_text=str(payload["raw_text"]) if payload.get("raw_text") is not None else None,
+            payload=require_mapping(payload.get("payload", {}), "payload"),
+            confidence=float(payload["confidence"]) if payload.get("confidence") is not None else None,
+            schema_version=int(payload.get("schema_version", 1)),
         )
 
 
@@ -113,7 +110,7 @@ class ThreadPlanTime:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any] | None) -> "ThreadPlanTime":
-        data = data or {}
+        data = require_mapping(data or {}, "plan_time")
         return cls(
             planned_start=str(data["planned_start"]) if data.get("planned_start") is not None else None,
             planned_end=str(data["planned_end"]) if data.get("planned_end") is not None else None,
@@ -133,7 +130,7 @@ class ThreadFactTime:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any] | None) -> "ThreadFactTime":
-        data = data or {}
+        data = require_mapping(data or {}, "fact_time")
         return cls(
             occurred_at=str(data["occurred_at"]) if data.get("occurred_at") is not None else None,
             completed_at=str(data["completed_at"]) if data.get("completed_at") is not None else None,
@@ -156,7 +153,7 @@ class ThreadContent:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any] | None) -> "ThreadContent":
-        data = data or {}
+        data = require_mapping(data or {}, "content")
         return cls(
             notes=str(data.get("notes", "")),
             outcome=str(data["outcome"]) if data.get("outcome") is not None else None,
@@ -188,12 +185,13 @@ class ThreadEventRef:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "ThreadEventRef":
+        payload = require_mapping(data, "event_ref")
         return cls(
-            event_id=str(data["event_id"]),
-            role=str(data["role"]),
-            added_at=str(data["added_at"]),
-            added_by=str(data["added_by"]),
-            confidence=float(data["confidence"]) if data.get("confidence") is not None else None,
+            event_id=str(payload["event_id"]),
+            role=str(payload["role"]),
+            added_at=str(payload["added_at"]),
+            added_by=str(payload["added_by"]),
+            confidence=float(payload["confidence"]) if payload.get("confidence") is not None else None,
         )
 
 
@@ -217,7 +215,7 @@ class ThreadMeta:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any] | None) -> "ThreadMeta":
-        data = data or {}
+        data = require_mapping(data or {}, "meta")
         return cls(
             created_by=str(data["created_by"]),
             updated_by=str(data["updated_by"]),
@@ -283,24 +281,25 @@ class ThreadRecord:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "ThreadRecord":
+        payload = require_mapping(data, "thread")
         return cls(
-            thread_id=str(data["thread_id"]),
-            thread_kind=str(data["thread_kind"]),
-            title=str(data["title"]),
-            status=str(data["status"]),
-            plan_time=ThreadPlanTime.from_dict(require_mapping(data.get("plan_time", {}), "plan_time")),
-            fact_time=ThreadFactTime.from_dict(require_mapping(data.get("fact_time", {}), "fact_time")),
-            content=ThreadContent.from_dict(require_mapping(data.get("content", {}), "content")),
+            thread_id=str(payload["thread_id"]),
+            thread_kind=str(payload["thread_kind"]),
+            title=str(payload["title"]),
+            status=str(payload["status"]),
+            plan_time=ThreadPlanTime.from_dict(require_mapping(payload.get("plan_time", {}), "plan_time")),
+            fact_time=ThreadFactTime.from_dict(require_mapping(payload.get("fact_time", {}), "fact_time")),
+            content=ThreadContent.from_dict(require_mapping(payload.get("content", {}), "content")),
             event_refs=[
                 ThreadEventRef.from_dict(item)
-                for item in data.get("event_refs", [])
+                for item in payload.get("event_refs", [])
                 if isinstance(item, dict)
             ],
-            meta=ThreadMeta.from_dict(require_mapping(data.get("meta", {}), "meta")),
-            first_event_at=str(data["first_event_at"]) if data.get("first_event_at") is not None else None,
-            last_event_at=str(data["last_event_at"]) if data.get("last_event_at") is not None else None,
-            created_at=str(data["created_at"]),
-            updated_at=str(data["updated_at"]),
+            meta=ThreadMeta.from_dict(require_mapping(payload.get("meta", {}), "meta")),
+            first_event_at=str(payload["first_event_at"]) if payload.get("first_event_at") is not None else None,
+            last_event_at=str(payload["last_event_at"]) if payload.get("last_event_at") is not None else None,
+            created_at=str(payload["created_at"]),
+            updated_at=str(payload["updated_at"]),
         )
 
 
@@ -435,7 +434,6 @@ class ProjectTurnThreadInput:
 @dataclass
 class ProjectTurnContext:
     source: str = "skill://timeline-memory"
-    recorded_at: str | None = None
     actor_id: str | None = None
     assistant_actor_id: str | None = None
 
@@ -443,13 +441,11 @@ class ProjectTurnContext:
     def from_dict(cls, data: dict[str, Any] | None) -> "ProjectTurnContext":
         payload = ensure_allowed_keys(require_mapping(data or {}, "context"), {
             "source",
-            "recorded_at",
             "actor_id",
             "assistant_actor_id",
         }, "context")
         return cls(
             source=str(payload.get("source", "skill://timeline-memory")),
-            recorded_at=str(payload["recorded_at"]) if payload.get("recorded_at") is not None else None,
             actor_id=str(payload["actor_id"]) if payload.get("actor_id") is not None else None,
             assistant_actor_id=(
                 str(payload["assistant_actor_id"]) if payload.get("assistant_actor_id") is not None else None
