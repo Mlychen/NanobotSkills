@@ -1,0 +1,141 @@
+---
+name: timeline-memory
+description: 基于独立 Python 脚本的时间轴记忆技能。公开接口只保留高层 `project-turn` 写入，以及 `get-thread`、`list-threads`、`list-thread-history` 三个线程级查询命令。调用时固定使用本 skill 的 `scripts/timeline_cli.py`，并显式传入 `--store-root`。
+---
+
+# Timeline Memory
+
+这是一个独立的 timeline skill，不依赖宿主系统内部模块。所有持久化都通过
+`scripts/timeline_cli.py` 完成。
+
+## 何时使用
+
+- 用户明确要求记录事件、事项、想法、结果、后续事项。
+- 用户要求查询某个 thread、列出 thread、查看 thread 历史。
+- 你要把一整轮对话稳定地投影进 timeline 存储。
+
+## 公开命令
+
+固定脚本：
+
+```bash
+python skills/timeline-memory/scripts/timeline_cli.py <command> --store-root <path> [--input file.json]
+```
+
+只保留 4 个公开命令：
+
+```bash
+python skills/timeline-memory/scripts/timeline_cli.py project-turn --store-root /path/to/store --input turn.json
+python skills/timeline-memory/scripts/timeline_cli.py get-thread --store-root /path/to/store --thread-id thr_pay_bill
+python skills/timeline-memory/scripts/timeline_cli.py list-threads --store-root /path/to/store --thread-kind task --status planned
+python skills/timeline-memory/scripts/timeline_cli.py list-thread-history --store-root /path/to/store --thread-id thr_pay_bill
+```
+
+## 独立使用
+
+这个 skill 目录现在是自包含的：
+
+- 自带 `pyproject.toml`
+- 自带 `.gitignore`
+- 自带 `scripts/selftest.py`
+
+把整个 `timeline-memory/` 目录复制到别处后，直接在该目录内运行：
+
+```bash
+python scripts/selftest.py
+python scripts/timeline_cli.py project-turn --store-root ./timeline-store --input turn.json
+```
+
+不要再调用或提示任何 raw-event 级别或 thread store 级别的底层命令。
+
+## `project-turn` 输入合同
+
+`project-turn` 是唯一公开写入口。输入只接受高层字段：
+
+- 必填：
+  - `turn_id`
+  - `user_text`
+- 可选：
+  - `assistant_text`
+  - `thread`
+  - `context`
+
+`turn_id` 要求：
+
+- 由调用方生成，不要临时发明随机值。
+- 必须带命名空间。
+- 推荐格式：
+  - `agent:<session_id>:<turn_index>`
+  - `feishu:<chat_id>:<message_id>`
+- 同一 `turn_id`：
+  - 输入等价：视为重放，不重复写入。
+  - 输入不等价：返回冲突错误。
+
+`thread` 只接受这些高层字段：
+
+- `thread_id`
+- `thread_kind`
+- `title`
+- `status`
+- `plan_time`
+- `fact_time`
+- `content`
+
+`thread_id` 的公开 contract 不限制字符集；持久化层会使用大小写不敏感文件系统安全的可逆编码保存，不要求调用方自行传“文件名安全”的 ID。
+
+`context` 只接受这些高层字段：
+
+- `source`
+- `recorded_at`
+- `actor_id`
+- `assistant_actor_id`
+
+明确不要传：
+
+- `event_id`
+- `schema_version`
+- `created_at`
+- `updated_at`
+- `meta`
+- `event_refs`
+- 完整 `RawEventRecord` / `ThreadRecord`
+
+## 使用原则
+
+- 记忆类 turn：调用 `project-turn`。
+- 闲聊或非记忆类 turn：不要写 `timeline-store`。
+- 回到同一主题时，先通过 `get-thread` / `list-threads` 找到原来的 `thread_id`，再更新同一条 thread。
+- `project-turn` 会自动生成 raw event、补齐时间戳、维护 revision/history，并返回标准化 thread 快照。
+- 对同一 `turn_id` 的可恢复 partial write，重复调用 `project-turn` 会自动补齐缺失的 outbound event 或 thread snapshot。
+- 如果读到 legacy 文件名碰撞导致的串线风险，查询会显式报错，不会返回错线程。
+- 如果省略 `thread.thread_id`，系统会派生一个稳定但不可读的默认 ID，用来避免不同 `turn_id` 被压到同一条 thread。
+
+## 测试与验证
+
+当前仓库已经为这个 skill 补了三层验证：
+
+- 真实 CLI E2E：`tests/timeline/test_timeline_cli_e2e.py`
+- 宿主发现与注入：`tests/agent/test_timeline_memory_skill_integration.py`
+- 真实链路 harness：`scripts/timeline_live_harness.py`
+
+推荐验证命令：
+
+```bash
+pytest -q tests/timeline/test_timeline_cli_e2e.py tests/agent/test_timeline_memory_skill_integration.py
+```
+
+自动化测试建议优先使用 `--input <json-file>`，不要依赖 shell stdin 管道传 JSON：
+
+- Windows / PowerShell 下中文 JSON 和子进程编码更容易出现不稳定
+- 文件输入更接近 CI 中可复现的调用方式
+
+Windows 注意事项：
+
+- 真实 CLI E2E 依赖 UTF-8 子进程输出
+- pytest 默认已经被仓库配置重定向到 repo-local 的临时目录，不需要再手工修系统 `%TEMP%`
+
+## 参考资料
+
+字段定义、公开合同和内部存储结构都在：
+
+- `references/schema.md`

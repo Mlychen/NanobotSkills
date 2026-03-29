@@ -1,0 +1,506 @@
+from __future__ import annotations
+
+import json
+from dataclasses import asdict, dataclass, field
+from typing import Any
+
+
+THREAD_EVENT_REF_ROLES = {"primary", "context", "evidence", "derived"}
+
+
+def require_mapping(value: Any, name: str) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise ValueError(f"{name} must be a mapping")
+    return dict(value)
+
+
+def ensure_allowed_keys(data: dict[str, Any], allowed: set[str], name: str) -> dict[str, Any]:
+    extra = sorted(set(data) - allowed)
+    if extra:
+        raise ValueError(f"{name} contains unsupported fields: {', '.join(extra)}")
+    return data
+
+
+def ensure_no_standardized_time_fields(payload: Any) -> None:
+    if isinstance(payload, dict):
+        for key, value in payload.items():
+            if key in {"plan_time", "fact_time"}:
+                raise ValueError("raw event payload must not contain plan_time or fact_time")
+            ensure_no_standardized_time_fields(value)
+    elif isinstance(payload, list):
+        for item in payload:
+            ensure_no_standardized_time_fields(item)
+
+
+def normalize_structured_list(values: Any, *, field_name: str) -> list[dict[str, Any]]:
+    if values is None:
+        return []
+    if not isinstance(values, list):
+        raise ValueError(f"{field_name} must be a list")
+    normalized: list[dict[str, Any]] = []
+    for item in values:
+        if isinstance(item, dict):
+            normalized.append(dict(item))
+            continue
+        normalized.append({"text": str(item)})
+    return normalized
+
+
+@dataclass
+class RawEventRecord:
+    event_id: str
+    event_type: str
+    recorded_at: str
+    source: str
+    actor_kind: str
+    actor_id: str | None = None
+    correlation_id: str | None = None
+    causation_id: str | None = None
+    raw_text: str | None = None
+    payload: dict[str, Any] = field(default_factory=dict)
+    confidence: float | None = None
+    schema_version: int = 1
+    created_at: str = ""
+
+    def __post_init__(self) -> None:
+        if not self.event_id:
+            raise ValueError("event_id is required")
+        if not self.event_type:
+            raise ValueError("event_type is required")
+        if not self.recorded_at:
+            raise ValueError("recorded_at is required")
+        if not self.source:
+            raise ValueError("source is required")
+        if not self.actor_kind:
+            raise ValueError("actor_kind is required")
+        if not self.created_at:
+            raise ValueError("created_at is required")
+        self.payload = require_mapping(self.payload, "payload")
+        ensure_no_standardized_time_fields(self.payload)
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "RawEventRecord":
+        return cls(
+            event_id=str(data["event_id"]),
+            event_type=str(data["event_type"]),
+            recorded_at=str(data["recorded_at"]),
+            source=str(data["source"]),
+            actor_kind=str(data["actor_kind"]),
+            actor_id=str(data["actor_id"]) if data.get("actor_id") is not None else None,
+            correlation_id=str(data["correlation_id"]) if data.get("correlation_id") is not None else None,
+            causation_id=str(data["causation_id"]) if data.get("causation_id") is not None else None,
+            raw_text=str(data["raw_text"]) if data.get("raw_text") is not None else None,
+            payload=require_mapping(data.get("payload", {}), "payload"),
+            confidence=float(data["confidence"]) if data.get("confidence") is not None else None,
+            schema_version=int(data.get("schema_version", 1)),
+            created_at=str(data["created_at"]),
+        )
+
+
+@dataclass
+class ThreadPlanTime:
+    planned_start: str | None = None
+    planned_end: str | None = None
+    due_at: str | None = None
+    all_day: bool = False
+    rrule: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any] | None) -> "ThreadPlanTime":
+        data = data or {}
+        return cls(
+            planned_start=str(data["planned_start"]) if data.get("planned_start") is not None else None,
+            planned_end=str(data["planned_end"]) if data.get("planned_end") is not None else None,
+            due_at=str(data["due_at"]) if data.get("due_at") is not None else None,
+            all_day=bool(data.get("all_day", False)),
+            rrule=str(data["rrule"]) if data.get("rrule") is not None else None,
+        )
+
+
+@dataclass
+class ThreadFactTime:
+    occurred_at: str | None = None
+    completed_at: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any] | None) -> "ThreadFactTime":
+        data = data or {}
+        return cls(
+            occurred_at=str(data["occurred_at"]) if data.get("occurred_at") is not None else None,
+            completed_at=str(data["completed_at"]) if data.get("completed_at") is not None else None,
+        )
+
+
+@dataclass
+class ThreadContent:
+    notes: str = ""
+    outcome: str | None = None
+    followups: list[dict[str, Any]] = field(default_factory=list)
+    items: list[dict[str, Any]] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        self.followups = [dict(item) for item in self.followups if isinstance(item, dict)]
+        self.items = [dict(item) for item in self.items if isinstance(item, dict)]
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any] | None) -> "ThreadContent":
+        data = data or {}
+        return cls(
+            notes=str(data.get("notes", "")),
+            outcome=str(data["outcome"]) if data.get("outcome") is not None else None,
+            followups=normalize_structured_list(data.get("followups", []), field_name="content.followups"),
+            items=normalize_structured_list(data.get("items", []), field_name="content.items"),
+        )
+
+
+@dataclass
+class ThreadEventRef:
+    event_id: str
+    role: str
+    added_at: str
+    added_by: str
+    confidence: float | None = None
+
+    def __post_init__(self) -> None:
+        if not self.event_id:
+            raise ValueError("event_id is required")
+        if self.role not in THREAD_EVENT_REF_ROLES:
+            raise ValueError(f"role must be one of {sorted(THREAD_EVENT_REF_ROLES)}")
+        if not self.added_at:
+            raise ValueError("added_at is required")
+        if not self.added_by:
+            raise ValueError("added_by is required")
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "ThreadEventRef":
+        return cls(
+            event_id=str(data["event_id"]),
+            role=str(data["role"]),
+            added_at=str(data["added_at"]),
+            added_by=str(data["added_by"]),
+            confidence=float(data["confidence"]) if data.get("confidence") is not None else None,
+        )
+
+
+@dataclass
+class ThreadMeta:
+    created_by: str
+    updated_by: str
+    revision: int = 1
+    confidence: float | None = None
+
+    def __post_init__(self) -> None:
+        if not self.created_by:
+            raise ValueError("created_by is required")
+        if not self.updated_by:
+            raise ValueError("updated_by is required")
+        if self.revision < 1:
+            raise ValueError("revision must be >= 1")
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any] | None) -> "ThreadMeta":
+        data = data or {}
+        return cls(
+            created_by=str(data["created_by"]),
+            updated_by=str(data["updated_by"]),
+            revision=int(data.get("revision", 1)),
+            confidence=float(data["confidence"]) if data.get("confidence") is not None else None,
+        )
+
+
+@dataclass
+class ThreadRecord:
+    thread_id: str
+    thread_kind: str
+    title: str
+    status: str
+    plan_time: ThreadPlanTime
+    fact_time: ThreadFactTime
+    content: ThreadContent
+    event_refs: list[ThreadEventRef]
+    meta: ThreadMeta
+    first_event_at: str | None = None
+    last_event_at: str | None = None
+    created_at: str = ""
+    updated_at: str = ""
+
+    def __post_init__(self) -> None:
+        if not self.thread_id:
+            raise ValueError("thread_id is required")
+        if not self.thread_kind:
+            raise ValueError("thread_kind is required")
+        if not self.title:
+            raise ValueError("title is required")
+        if not self.status:
+            raise ValueError("status is required")
+        if not self.created_at:
+            raise ValueError("created_at is required")
+        if not self.updated_at:
+            raise ValueError("updated_at is required")
+        seen: set[str] = set()
+        deduped: list[ThreadEventRef] = []
+        for ref in self.event_refs:
+            if ref.event_id in seen:
+                continue
+            seen.add(ref.event_id)
+            deduped.append(ref)
+        self.event_refs = deduped
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "thread_id": self.thread_id,
+            "thread_kind": self.thread_kind,
+            "title": self.title,
+            "status": self.status,
+            "plan_time": self.plan_time.to_dict(),
+            "fact_time": self.fact_time.to_dict(),
+            "content": self.content.to_dict(),
+            "event_refs": [ref.to_dict() for ref in self.event_refs],
+            "meta": self.meta.to_dict(),
+            "first_event_at": self.first_event_at,
+            "last_event_at": self.last_event_at,
+            "created_at": self.created_at,
+            "updated_at": self.updated_at,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "ThreadRecord":
+        return cls(
+            thread_id=str(data["thread_id"]),
+            thread_kind=str(data["thread_kind"]),
+            title=str(data["title"]),
+            status=str(data["status"]),
+            plan_time=ThreadPlanTime.from_dict(require_mapping(data.get("plan_time", {}), "plan_time")),
+            fact_time=ThreadFactTime.from_dict(require_mapping(data.get("fact_time", {}), "fact_time")),
+            content=ThreadContent.from_dict(require_mapping(data.get("content", {}), "content")),
+            event_refs=[
+                ThreadEventRef.from_dict(item)
+                for item in data.get("event_refs", [])
+                if isinstance(item, dict)
+            ],
+            meta=ThreadMeta.from_dict(require_mapping(data.get("meta", {}), "meta")),
+            first_event_at=str(data["first_event_at"]) if data.get("first_event_at") is not None else None,
+            last_event_at=str(data["last_event_at"]) if data.get("last_event_at") is not None else None,
+            created_at=str(data["created_at"]),
+            updated_at=str(data["updated_at"]),
+        )
+
+
+@dataclass
+class ProjectTurnPlanTime:
+    planned_start: str | None = None
+    planned_end: str | None = None
+    due_at: str | None = None
+    all_day: bool = False
+    rrule: str | None = None
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any] | None) -> "ProjectTurnPlanTime":
+        payload = ensure_allowed_keys(require_mapping(data or {}, "thread.plan_time"), {
+            "planned_start",
+            "planned_end",
+            "due_at",
+            "all_day",
+            "rrule",
+        }, "thread.plan_time")
+        return cls(
+            planned_start=str(payload["planned_start"]) if payload.get("planned_start") is not None else None,
+            planned_end=str(payload["planned_end"]) if payload.get("planned_end") is not None else None,
+            due_at=str(payload["due_at"]) if payload.get("due_at") is not None else None,
+            all_day=bool(payload.get("all_day", False)),
+            rrule=str(payload["rrule"]) if payload.get("rrule") is not None else None,
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
+class ProjectTurnFactTime:
+    occurred_at: str | None = None
+    completed_at: str | None = None
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any] | None) -> "ProjectTurnFactTime":
+        payload = ensure_allowed_keys(require_mapping(data or {}, "thread.fact_time"), {
+            "occurred_at",
+            "completed_at",
+        }, "thread.fact_time")
+        return cls(
+            occurred_at=str(payload["occurred_at"]) if payload.get("occurred_at") is not None else None,
+            completed_at=str(payload["completed_at"]) if payload.get("completed_at") is not None else None,
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
+class ProjectTurnContent:
+    notes: str = ""
+    outcome: str | None = None
+    followups: list[dict[str, Any]] = field(default_factory=list)
+    items: list[dict[str, Any]] = field(default_factory=list)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any] | None) -> "ProjectTurnContent":
+        payload = ensure_allowed_keys(require_mapping(data or {}, "thread.content"), {
+            "notes",
+            "outcome",
+            "followups",
+            "items",
+        }, "thread.content")
+        return cls(
+            notes=str(payload.get("notes", "")),
+            outcome=str(payload["outcome"]) if payload.get("outcome") is not None else None,
+            followups=normalize_structured_list(payload.get("followups", []), field_name="thread.content.followups"),
+            items=normalize_structured_list(payload.get("items", []), field_name="thread.content.items"),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
+class ProjectTurnThreadInput:
+    title: str
+    status: str
+    thread_id: str | None = None
+    thread_kind: str = "task"
+    plan_time: ProjectTurnPlanTime = field(default_factory=ProjectTurnPlanTime)
+    fact_time: ProjectTurnFactTime = field(default_factory=ProjectTurnFactTime)
+    content: ProjectTurnContent = field(default_factory=ProjectTurnContent)
+
+    def __post_init__(self) -> None:
+        if not self.title:
+            raise ValueError("thread.title is required")
+        if not self.status:
+            raise ValueError("thread.status is required")
+        if not self.thread_kind:
+            raise ValueError("thread.thread_kind must not be empty")
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any] | None) -> "ProjectTurnThreadInput | None":
+        if data is None:
+            return None
+        payload = ensure_allowed_keys(require_mapping(data, "thread"), {
+            "thread_id",
+            "thread_kind",
+            "title",
+            "status",
+            "plan_time",
+            "fact_time",
+            "content",
+        }, "thread")
+        return cls(
+            thread_id=str(payload["thread_id"]) if payload.get("thread_id") is not None else None,
+            thread_kind=str(payload.get("thread_kind", "task")),
+            title=str(payload["title"]),
+            status=str(payload["status"]),
+            plan_time=ProjectTurnPlanTime.from_dict(payload.get("plan_time")),
+            fact_time=ProjectTurnFactTime.from_dict(payload.get("fact_time")),
+            content=ProjectTurnContent.from_dict(payload.get("content")),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "thread_id": self.thread_id,
+            "thread_kind": self.thread_kind,
+            "title": self.title,
+            "status": self.status,
+            "plan_time": self.plan_time.to_dict(),
+            "fact_time": self.fact_time.to_dict(),
+            "content": self.content.to_dict(),
+        }
+
+
+@dataclass
+class ProjectTurnContext:
+    source: str = "skill://timeline-memory"
+    recorded_at: str | None = None
+    actor_id: str | None = None
+    assistant_actor_id: str | None = None
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any] | None) -> "ProjectTurnContext":
+        payload = ensure_allowed_keys(require_mapping(data or {}, "context"), {
+            "source",
+            "recorded_at",
+            "actor_id",
+            "assistant_actor_id",
+        }, "context")
+        return cls(
+            source=str(payload.get("source", "skill://timeline-memory")),
+            recorded_at=str(payload["recorded_at"]) if payload.get("recorded_at") is not None else None,
+            actor_id=str(payload["actor_id"]) if payload.get("actor_id") is not None else None,
+            assistant_actor_id=(
+                str(payload["assistant_actor_id"]) if payload.get("assistant_actor_id") is not None else None
+            ),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
+class ProjectTurnInput:
+    turn_id: str
+    user_text: str
+    assistant_text: str | None = None
+    thread: ProjectTurnThreadInput | None = None
+    context: ProjectTurnContext = field(default_factory=ProjectTurnContext)
+
+    def __post_init__(self) -> None:
+        if not self.turn_id:
+            raise ValueError("turn_id is required")
+        if ":" not in self.turn_id:
+            raise ValueError("turn_id must be namespaced, for example agent:<session_id>:<turn_index>")
+        if not self.user_text:
+            raise ValueError("user_text is required")
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "ProjectTurnInput":
+        payload = ensure_allowed_keys(require_mapping(data, "project-turn input"), {
+            "turn_id",
+            "user_text",
+            "assistant_text",
+            "thread",
+            "context",
+        }, "project-turn input")
+        return cls(
+            turn_id=str(payload["turn_id"]),
+            user_text=str(payload["user_text"]),
+            assistant_text=str(payload["assistant_text"]) if payload.get("assistant_text") is not None else None,
+            thread=ProjectTurnThreadInput.from_dict(payload.get("thread")),
+            context=ProjectTurnContext.from_dict(payload.get("context")),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "turn_id": self.turn_id,
+            "user_text": self.user_text,
+            "assistant_text": self.assistant_text,
+            "thread": self.thread.to_dict() if self.thread is not None else None,
+            "context": self.context.to_dict(),
+        }
+
+    def fingerprint(self) -> str:
+        return json.dumps(self.to_dict(), ensure_ascii=False, sort_keys=True, separators=(",", ":"))

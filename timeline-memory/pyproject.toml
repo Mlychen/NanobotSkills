@@ -1,0 +1,6 @@
+[project]
+name = "timeline-memory-skill"
+version = "0.1.0"
+description = "Standalone timeline-memory skill bundle"
+requires-python = ">=3.11"
+dependencies = []
