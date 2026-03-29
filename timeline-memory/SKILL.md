@@ -112,16 +112,48 @@ python scripts/timeline_cli.py project-turn --store-root ./timeline-store --inpu
 
 ## 测试与验证
 
-当前仓库已经为这个 skill 补了三层验证：
+当前仓库已经为这个 skill 补了两层宿主级验证：
 
 - 真实 CLI E2E：`tests/timeline/test_timeline_cli_e2e.py`
 - 宿主发现与注入：`tests/agent/test_timeline_memory_skill_integration.py`
-- 真实链路 harness：`scripts/timeline_live_harness.py`
 
-推荐验证命令：
+推荐入口命令（默认 `sandbox-safe`，优先稳定）：
 
 ```bash
-pytest -q tests/timeline/test_timeline_cli_e2e.py tests/agent/test_timeline_memory_skill_integration.py
+python scripts/run-host-tests.py
+```
+
+连续稳定性回归（连跑 3 轮）：
+
+```bash
+python scripts/run-host-tests.py --rounds 3
+```
+
+标准模式（权限正常机器上可选，保留 pytest 默认插件）：
+
+```bash
+python scripts/run-host-tests.py --mode standard
+```
+
+测试运行配置（环境变量）：
+
+- `TIMELINE_TEST_MODE`
+  - 默认：`sandbox-safe`
+  - 可选：`sandbox-safe` / `standard`
+- `TIMELINE_TEST_TMP_ROOT`
+  - 默认：`tmp/test-runtime`
+  - 可选：显式指定测试运行时根目录（相对路径按 repo root 解析）
+
+清理测试工件（只清理 `tmp/test-runtime`，并报告历史 `pytest-cache-files-*`，不强删）：
+
+```bash
+python scripts/clean-test-artifacts.py
+```
+
+也可以直接跑 pytest（默认会根据入口脚本注入环境变量和参数，建议优先使用入口脚本）：
+
+```bash
+python -m pytest -q tests/timeline/test_timeline_cli_e2e.py tests/agent/test_timeline_memory_skill_integration.py
 ```
 
 自动化测试建议优先使用 `--input <json-file>`，不要依赖 shell stdin 管道传 JSON：
@@ -132,7 +164,10 @@ pytest -q tests/timeline/test_timeline_cli_e2e.py tests/agent/test_timeline_memo
 Windows 注意事项：
 
 - 真实 CLI E2E 依赖 UTF-8 子进程输出
-- pytest 默认已经被仓库配置重定向到 repo-local 的临时目录，不需要再手工修系统 `%TEMP%`
+- 入口脚本会强制注入 `PYTHONIOENCODING=utf-8`、`PYTHONUTF8=1`
+- 入口脚本会固定 `TMP/TEMP/TMPDIR` 到 repo-local `tmp/test-runtime`
+- 在 `sandbox-safe` 模式下会禁用 `tmpdir` / `cacheprovider`，用于隔离 ACL 异常导致的 `WinError 5`
+- 如果历史残留了根目录 `pytest-cache-files-*` 且不可访问，使用 `clean-test-artifacts` 查看报告后按系统权限策略处理
 
 ## 参考资料
 
