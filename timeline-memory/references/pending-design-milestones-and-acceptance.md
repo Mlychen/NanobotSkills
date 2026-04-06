@@ -60,11 +60,15 @@
 
 当前实现观察：
 
-- 当前 `project-turn` 主路径在 [timeline_cli.py](file:///d:/Code/NanobotSkills/timeline-memory/scripts/timeline_cli.py#L440-L475) 中按 `inbound raw -> outbound raw -> thread` 顺序落盘
-- 当前线程更新在 [store.py](file:///d:/Code/NanobotSkills/timeline-memory/scripts/store.py#L346-L357) 中是“先 append history，再写 snapshot”
-- 这会暴露两类中间态：
-  - raw events 已完整，但 thread snapshot/history 尚未收敛
-  - history 已追加，但 snapshot 仍是旧版本，重复恢复时可能产生重复 history
+- 当前 `project-turn` 入口在 [timeline_cli.py](file:///d:/Code/NanobotSkills/timeline-memory/scripts/timeline_cli.py#L628-L708) 中已经调整为“先查事务，再走 legacy replay，最后进入新事务主路径”
+- 当前事务执行在 [timeline_cli.py](file:///d:/Code/NanobotSkills/timeline-memory/scripts/timeline_cli.py#L517-L607) 中按 `prepared -> raw_committed -> snapshot_committed -> history_committed -> committed` 推进
+- 当前 thread 写入底层能力在 [store.py](file:///d:/Code/NanobotSkills/timeline-memory/scripts/store.py#L458-L544) 中已经具备：
+  - snapshot 单独写入
+  - history 单独追加
+  - normalize-for-write 归一化能力
+- 当前仍保留的兼容窗口：
+  - 事务文件不存在时，仍允许回退到既有 replay/repair 路径
+  - 故障注入覆盖已补关键阶段，但尚未把所有矩阵场景都写成更细粒度用例
 
 事务文件约束：
 
@@ -147,9 +151,14 @@
   - raw batch 已具备“部分已提交可补齐、内容冲突即失败”的幂等语义
   - snapshot 已具备 temp + replace 与 thread 归属校验
   - history append 已补最小去重保护，避免重复追加同内容条目
-- 尚未完成的核心缺口：
-  - `timeline_cli.py` 中的 `project-turn` 仍是直接写入主路径，尚未切为显式 P0-P5 阶段机
-  - 恢复入口仍以现有 replay 推断逻辑为主，尚未改成“事务优先，旧路径兜底”
+- 已完成主路径切换：
+  - `timeline_cli.py` 已引入事务 payload 构造、prepare、advance 与 txn 执行 helper
+  - `project-turn` 新写入主路径已切为显式 P0-P5 阶段机
+  - 恢复入口已改为“事务优先，旧路径兜底”
+  - 更新 thread 时已经按“先 snapshot、后 history”顺序收敛
+- 当前剩余工作：
+  - 将故障注入测试矩阵继续细化，补齐更多“阶段内中断 + 重放”组合
+  - 视需要清理 legacy replay 与 txn 路径间的重复判断逻辑
 
 后续推进边界：
 
@@ -160,24 +169,24 @@
 
 推荐落地顺序：
 
-- 第一段：抽事务辅助函数
-  - 在 `timeline_cli.py` 中新增事务构造、prepare、阶段推进辅助函数
-  - 统一封装 `prepared`、`raw_committed`、`snapshot_committed`、`history_committed`、`committed` 的推进逻辑
-- 第二段：改正常写入主路径
-  - 把当前 `project-turn` 的新写入流程改成显式 P0-P5 阶段机
+- 第一段：已完成
+  - 已在 `timeline_cli.py` 中新增事务构造、prepare、阶段推进辅助函数
+  - 已统一封装 `prepared`、`raw_committed`、`snapshot_committed`、`history_committed`、`committed` 的推进逻辑
+- 第二段：已完成
+  - `project-turn` 新写入流程已切为显式 P0-P5 阶段机
   - P0 写事务
   - P1 调用 `append_raw_events_batch()`
-  - P2 计算并落盘 `target_snapshot` / `history_entry` 等恢复元数据
+  - P2 计算并落盘 `target_snapshot` / `history_entry`
   - P3 执行 snapshot 原子替换
   - P4 追加 history
   - P5 标记 `committed` 并清理事务文件
-- 第三段：改恢复入口
-  - `project-turn` 启动时优先检查事务文件
-  - 若事务存在，按阶段继续恢复
-  - 若事务不存在，再回退到现有 replay/repair 推断逻辑
-- 第四段：补 CLI 级故障注入测试
-  - 重点覆盖 `prepared`、`raw_committed`、`snapshot_committed`、`history_committed` 四类中断恢复
-  - 把“重复恢复不重复 history”作为硬约束落测试
+- 第三段：已完成
+  - `project-turn` 启动时已优先检查事务文件
+  - 事务存在时按阶段继续恢复
+  - 事务不存在时回退到现有 replay/repair 推断逻辑
+- 第四段：进行中
+  - 已覆盖 `prepared`、`raw_committed`、`snapshot_committed`、`history_committed` 四类事务中断恢复
+  - 下一步继续把“重复恢复不重复 history”扩展成更系统的故障注入矩阵
 
 建议代码组织：
 
@@ -196,30 +205,30 @@
 
 - 第一步：在 `store.py` 增加事务文件读写、snapshot 临时写入与原子替换能力（已完成）
 - 第二步：在 `TimelineStore` 增加 `append_raw_events_batch()`，统一批量写 raw events（已完成）
-- 第三步：在 `timeline_cli.py` 中先抽事务 helper，再把 `project-turn` 改写为显式阶段机（下一步）
-- 第四步：把现有 replay/repair 改成“事务优先，旧路径兜底”（第三步完成后进行）
-- 第五步：补故障注入测试与回归测试（在主路径切换后集中补齐）
+- 第三步：在 `timeline_cli.py` 中抽事务 helper，并把 `project-turn` 改写为显式阶段机（已完成）
+- 第四步：把现有 replay/repair 改成“事务优先，旧路径兜底”（已完成）
+- 第五步：补故障注入测试与回归测试（进行中）
 
 测试矩阵：
 
 - 创建 thread 场景故障注入：
-  - 准备事务后中断
-  - raw 批量写入后中断
-  - snapshot 替换后中断
+  - 准备事务后中断（已覆盖）
+  - raw 批量写入后中断（已覆盖）
+  - snapshot 替换后中断（已覆盖）
 - 更新 thread 场景故障注入：
-  - raw 完成但 snapshot 未写
-  - snapshot 已替换但 history 未追加
-  - history 已追加但事务未清理
+  - raw 完成但 snapshot 未写（已覆盖）
+  - snapshot 已替换但 history 未追加（已覆盖）
+  - history 已追加但事务未清理（已覆盖）
 - 现有恢复路径回归：
-  - inbound-only
-  - no-thread
-  - missing-snapshot
-  - snapshot-restore
-  - existing-thread repair
+  - inbound-only（已覆盖）
+  - no-thread（已覆盖）
+  - missing-snapshot（已覆盖）
+  - snapshot-restore（已覆盖）
+  - existing-thread repair（已覆盖）
 - 新增幂等恢复断言：
-  - 同一 `turn_id` 连续重放 2 次以上不产生重复 history
-  - 任一阶段中断后再次执行都收敛到同一最终 snapshot 与 raw event 集合
-  - 更新 thread 时 history 条目数与 revision 增量严格一致
+  - 同一 `turn_id` 连续重放 2 次以上不产生重复 history（部分覆盖，需继续扩展）
+  - 任一阶段中断后再次执行都收敛到同一最终 snapshot 与 raw event 集合（关键阶段已覆盖）
+  - 更新 thread 时 history 条目数与 revision 增量严格一致（已覆盖）
 
 ## 里程碑 M3：并发写入语义
 
