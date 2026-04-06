@@ -1,8 +1,8 @@
-# Timeline Memory 未完成设计项里程碑与验收标准
+# Timeline Memory 设计里程碑状态与验收标准
 
 ## 目标
 
-将当前已识别但未完全落地的设计项转化为可执行迭代，确保实现与以下原则一致：
+汇总当前设计里程碑的落地状态、验收标准与后续交接边界，确保实现与以下原则一致：
 
 - 一致性优先
 - 幂等与可恢复
@@ -60,9 +60,9 @@
 
 当前实现观察：
 
-- 当前 `project-turn` 入口在 [timeline_cli.py](file:///d:/Code/NanobotSkills/timeline-memory/scripts/timeline_cli.py#L628-L708) 中已经调整为“先查事务，再走 legacy replay，最后进入新事务主路径”
-- 当前事务执行在 [timeline_cli.py](file:///d:/Code/NanobotSkills/timeline-memory/scripts/timeline_cli.py#L517-L607) 中按 `prepared -> raw_committed -> snapshot_committed -> history_committed -> committed` 推进
-- 当前 thread 写入底层能力在 [store.py](file:///d:/Code/NanobotSkills/timeline-memory/scripts/store.py#L458-L544) 中已经具备：
+- 当前 `project-turn` 入口在 [timeline_cli.py](file:///d:/Code/NanobotSkills/timeline-memory/scripts/timeline_cli.py#L1079-L1203) 中已经调整为“先查事务，再走 legacy replay，最后进入新事务主路径”
+- 当前事务执行在 [timeline_cli.py](file:///d:/Code/NanobotSkills/timeline-memory/scripts/timeline_cli.py#L897-L988) 中按 `prepared -> raw_committed -> snapshot_committed -> history_committed -> committed` 推进
+- 当前 thread 写入底层能力在 [store.py](file:///d:/Code/NanobotSkills/timeline-memory/scripts/store.py#L514-L642) 中已经具备：
   - snapshot 单独写入
   - history 单独追加
   - normalize-for-write 归一化能力
@@ -156,18 +156,18 @@
   - `project-turn` 新写入主路径已切为显式 P0-P5 阶段机
   - 恢复入口已改为“事务优先，旧路径兜底”
   - 更新 thread 时已经按“先 snapshot、后 history”顺序收敛
-- 当前剩余工作：
-  - 将故障注入测试矩阵继续细化，补齐更多“阶段内中断 + 重放”组合
-  - 视需要清理 legacy replay 与 txn 路径间的重复判断逻辑
+- 收口备注：
+  - 故障注入测试矩阵已覆盖关键恢复与重放组合；如后续仍需扩展，应作为增量回归继续补齐
+  - legacy replay 与 txn 路径间的重复判断逻辑已完成首轮收敛；后续若继续清理，应视作内部整理而非 M2 未完成项
 
-后续推进边界：
+交接边界：
 
-- 下一阶段只改 `project-turn` 写入与恢复主路径
+- M2 收口范围只覆盖 `project-turn` 写入与恢复主路径
 - 不修改公开 CLI 输入输出合同
 - 不修改查询命令与查询结果结构
 - 不在本阶段引入新的并发语义
 
-推荐落地顺序：
+已完成落地顺序：
 
 - 第一段：已完成
   - 已在 `timeline_cli.py` 中新增事务构造、prepare、阶段推进辅助函数
@@ -187,16 +187,16 @@
 - 第四段：已完成
   - 已覆盖 `prepared`、`raw_committed`、`snapshot_committed`、`history_committed` 四类事务中断恢复
   - 已覆盖 `prepared`、`raw_committed`、`snapshot_committed`、`history_committed` 后连续执行恢复 + 重放不重复追加 history 的关键场景
-  - 已开始收敛 `timeline_cli.py` 中 txn 恢复与 legacy replay 的重复判断
+  - 已完成 `timeline_cli.py` 中 txn 恢复与 legacy replay 重复判断的首轮收敛
   - 已将 replay 推断与恢复流程收敛为显式结构：`ReplayRawState`、`ReplayThreadState`、`ReplayRecoveryPlan`、`ReplayResult`
   - `execute_replay_recovery()` 已改为消费显式 recovery plan，不再依赖内部松散字典约定
   - 宿主测试入口已优先复用当前解释器执行 `pytest`，仅在当前环境缺少 `pytest` 时回退到 `uv run --extra dev`
-  - 已继续把 replay recovery 拆为 raw/thread 两类独立 helper，并用 `thread_action` 收口线程恢复分支
-  - 已开始复用 replay 与 txn 两条恢复路径中的 thread write plan 构造，统一 target snapshot / history entry 的生成逻辑
-  - 已开始复用 replay raw 补齐与 txn raw 阶段推进中的共享 raw commit helper
+  - 已将 replay recovery 拆为 raw/thread 两类独立 helper，并用 `thread_action` 收口线程恢复分支
+  - 已复用 replay 与 txn 两条恢复路径中的 thread write plan 构造，统一 target snapshot / history entry 的生成逻辑
+  - 已复用 replay raw 补齐与 txn raw 阶段推进中的共享 raw commit helper
   - 已补“阶段内中断 + 恢复 + 再重放”组合回归，验证最终 raw / thread / history 状态收敛一致
 
-建议代码组织：
+代码组织回顾：
 
 - 先在 `timeline_cli.py` 内引入小粒度 helper，避免把所有阶段判断堆进 `cmd_project_turn()`
 - 建议拆出：
@@ -277,14 +277,14 @@
 
 当前实现进展：
 
-- `project-turn` 写入主路径已在 [cmd_project_turn](file:///d:/Code/NanobotSkills/timeline-memory/scripts/timeline_cli.py#L912-L951) 中包裹 `store.project_turn_write_lock(...)`，`recover_or_replay_project_turn()`、`prepare_project_turn_txn()`、`execute_project_turn_txn()` 已统一纳入同一临界区
-- `store-root` 级写锁原语已在 [store.py](file:///d:/Code/NanobotSkills/timeline-memory/scripts/store.py#L164-L213) 中落地，并通过 [TimelineStore.project_turn_write_lock()](file:///d:/Code/NanobotSkills/timeline-memory/scripts/store.py#L676-L679) 暴露给 CLI 主路径
-- 事务文件写入仍由 [ProjectTurnTxnStore.write()](file:///d:/Code/NanobotSkills/timeline-memory/scripts/store.py#L384-L404) 负责单 `turn_id` 幂等合并，但外层已由单写者锁消除不同写者同时推进阶段的竞争
-- raw event 追加与 thread snapshot/history 写入逻辑本身未改公开合同，仍分别位于 [store.py](file:///d:/Code/NanobotSkills/timeline-memory/scripts/store.py#L310-L335) 与 [store.py](file:///d:/Code/NanobotSkills/timeline-memory/scripts/store.py#L592-L603)，但已由同一锁序列化保护
+- `project-turn` 写入主路径已在 [cmd_project_turn](file:///d:/Code/NanobotSkills/timeline-memory/scripts/timeline_cli.py#L1164-L1203) 中包裹 `store.project_turn_write_lock(...)`，`recover_or_replay_project_turn()`、`prepare_project_turn_txn()`、`execute_project_turn_txn()` 已统一纳入同一临界区
+- `store-root` 级写锁原语已在 [store.py](file:///d:/Code/NanobotSkills/timeline-memory/scripts/store.py#L182-L230) 中落地，并通过 [TimelineStore.project_turn_write_lock()](file:///d:/Code/NanobotSkills/timeline-memory/scripts/store.py#L727-L729) 暴露给 CLI 主路径
+- 事务文件写入仍由 [ProjectTurnTxnStore.write()](file:///d:/Code/NanobotSkills/timeline-memory/scripts/store.py#L408-L428) 负责单 `turn_id` 幂等合并，但外层已由单写者锁消除不同写者同时推进阶段的竞争
+- raw event 追加与 thread snapshot/history 写入逻辑本身未改公开合同，仍分别位于 [store.py](file:///d:/Code/NanobotSkills/timeline-memory/scripts/store.py#L334-L360) 与 [store.py](file:///d:/Code/NanobotSkills/timeline-memory/scripts/store.py#L588-L642)，但已由同一锁序列化保护
 - 首轮真实并发回归已补齐：
-  - 同 thread 不同 `turn_id` 串行收敛：[test_timeline_cli_e2e.py:L1420-L1487](file:///d:/Code/NanobotSkills/timeline-memory/tests/timeline/test_timeline_cli_e2e.py#L1420-L1487)
-  - 同 `turn_id` 等价并发幂等：[test_timeline_cli_e2e.py:L1490-L1536](file:///d:/Code/NanobotSkills/timeline-memory/tests/timeline/test_timeline_cli_e2e.py#L1490-L1536)
-  - 同 `turn_id` 非等价并发冲突：[test_timeline_cli_e2e.py:L1539-L1585](file:///d:/Code/NanobotSkills/timeline-memory/tests/timeline/test_timeline_cli_e2e.py#L1539-L1585)
+  - 同 thread 不同 `turn_id` 串行收敛：[test_timeline_cli_e2e.py:L1816-L1884](file:///d:/Code/NanobotSkills/timeline-memory/tests/timeline/test_timeline_cli_e2e.py#L1816-L1884)
+  - 同 `turn_id` 等价并发幂等：[test_timeline_cli_e2e.py:L1886-L1933](file:///d:/Code/NanobotSkills/timeline-memory/tests/timeline/test_timeline_cli_e2e.py#L1886-L1933)
+  - 同 `turn_id` 非等价并发冲突：[test_timeline_cli_e2e.py:L1935-L1982](file:///d:/Code/NanobotSkills/timeline-memory/tests/timeline/test_timeline_cli_e2e.py#L1935-L1982)
   - 宿主层 busy timeout 冒烟：[test_timeline_memory_skill_integration.py:L182-L208](file:///d:/Code/NanobotSkills/timeline-memory/tests/agent/test_timeline_memory_skill_integration.py#L182-L208)
 
 推荐落地顺序：
@@ -296,7 +296,7 @@
   - 对外先只提供内部 helper / context manager，不改 CLI 参数
 
 - 第二段：把 `project-turn` 主路径整体包进临界区（已完成）
-  - 将 [cmd_project_turn](file:///d:/Code/NanobotSkills/timeline-memory/scripts/timeline_cli.py#L912-L951) 改为“先拿锁，再执行 replay/prepare/txn/cleanup”
+  - 将 [cmd_project_turn](file:///d:/Code/NanobotSkills/timeline-memory/scripts/timeline_cli.py#L1164-L1203) 改为“先拿锁，再执行 replay/prepare/txn/cleanup”
   - 明确要求：加锁后重新读取 txn 与 baseline，禁止在锁外先做 replay 判断
   - 保持现有 M2 阶段机不变，只改变其执行前后的并发边界
   - 对无 thread 的 turn 也保持同一路径加锁，因为仍会写 `raw_events.jsonl` 与 txn 文件
@@ -344,13 +344,13 @@
 - `uv run python scripts/selftest.py` 已通过
 - 当前工作区相关文件 diagnostics 为 `0`
 
-当前判断：
+收口判断：
 
 - M3 第一版核心目标已经落地：同一 `store-root` 的 `project-turn` 写入已具备单写者串行化语义
 - 首轮并发测试已覆盖最关键的四类行为：同 thread 串行收敛、同 `turn_id` 幂等、同 `turn_id` 冲突、busy timeout
-- M3 剩余工作不再是“是否需要并发控制”，而是是否继续扩展测试矩阵，以及在 M4 中把当前稳定错误文本收口为结构化错误码
+- M3 已完成第一版闭环；后续若继续扩展测试矩阵或细化错误码，应作为后续增强而非本里程碑未完成项
 
-当前建议：
+交接建议：
 
 - M3 第一版不要急于做 per-thread 锁、raw-events 锁、txn 锁三层组合
 - 先用 `store-root` 级单写者把语义做对，再看是否值得为吞吐量拆锁
@@ -387,9 +387,9 @@
 
 为什么现在做 M4：
 
-- 当前 CLI 总出口仍是 [timeline_cli.py:L1213-L1219](file:///d:/Code/NanobotSkills/timeline-memory/scripts/timeline_cli.py#L1213-L1219) 的统一失败出口；在 M4 之前，外部只能靠文本做分支
+- 当前 CLI 总出口仍是 [timeline_cli.py:L1432-L1438](file:///d:/Code/NanobotSkills/timeline-memory/scripts/timeline_cli.py#L1432-L1438) 的统一失败出口；在 M4 之前，外部只能靠文本做分支
 - 当前测试中已经有多处对错误字符串做子串断言，例如：
-  - [test_timeline_cli_e2e.py:L1213-L1417](file:///d:/Code/NanobotSkills/timeline-memory/tests/timeline/test_timeline_cli_e2e.py#L1213-L1417)
+  - [test_timeline_cli_e2e.py:L1421-L1774](file:///d:/Code/NanobotSkills/timeline-memory/tests/timeline/test_timeline_cli_e2e.py#L1421-L1774)
   - [test_timeline_memory_skill_integration.py:L182-L208](file:///d:/Code/NanobotSkills/timeline-memory/tests/agent/test_timeline_memory_skill_integration.py#L182-L208)
 - M3 已引入 busy / timeout 语义；如果不尽快结构化，这些语义会先以错误文案形式沉淀成隐式合同
 - 当前 store 层、replay 层、CLI 入口层都直接抛 `ValueError` / `RuntimeError`，但没有统一的“错误类别 -> 错误码 -> 输出模型”映射层
@@ -482,10 +482,10 @@
 - 当前参数解析错误与业务输入错误要分开看：
   - `argparse` 层的 CLI 解析失败暂不纳入第一步结构化改造
   - 命令执行阶段的 payload/schema/业务参数错误进入 `TM_INVALID_ARGUMENT`
-- 当前命令执行错误已统一落到 [main](file:///d:/Code/NanobotSkills/timeline-memory/scripts/timeline_cli.py#L1213-L1219) 的通用异常出口，并在这里完成“异常 -> 结构化错误对象”的集中映射
+- 当前命令执行错误已统一落到 [main](file:///d:/Code/NanobotSkills/timeline-memory/scripts/timeline_cli.py#L1432-L1438) 的通用异常出口，并在这里完成“异常 -> 结构化错误对象”的集中映射
 - 当前 store 层已有比较明确的错误前缀，可作为首版映射基础：
-  - [store.py:L310-L335](file:///d:/Code/NanobotSkills/timeline-memory/scripts/store.py#L310-L335)
-  - [store.py:L384-L404](file:///d:/Code/NanobotSkills/timeline-memory/scripts/store.py#L384-L404)
+  - [store.py:L334-L360](file:///d:/Code/NanobotSkills/timeline-memory/scripts/store.py#L334-L360)
+  - [store.py:L408-L428](file:///d:/Code/NanobotSkills/timeline-memory/scripts/store.py#L408-L428)
 - 当前 replay / recovery 路径也已有较稳定的冲突文案，可先按 message 前缀分组映射，再逐步收敛为显式异常类型
 
 推荐落地顺序：
@@ -496,7 +496,7 @@
   - 整理首批稳定错误码表与 message 前缀映射关系
 
 - 第二段：改造统一错误出口
-  - 将 [main](file:///d:/Code/NanobotSkills/timeline-memory/scripts/timeline_cli.py#L1213-L1219) 从纯文本 stderr 改为结构化 JSON stderr
+  - 将 [main](file:///d:/Code/NanobotSkills/timeline-memory/scripts/timeline_cli.py#L1432-L1438) 从纯文本 stderr 改为结构化 JSON stderr
   - 保持命令失败退出码 `1`
   - 确保成功路径 `stdout` 合同完全不变
 
@@ -552,8 +552,8 @@
   - [ThreadEventRef](file:///d:/Code/NanobotSkills/timeline-memory/scripts/models.py#L165-L195) 已包含 `role` 与 `confidence`
   - [ThreadMeta](file:///d:/Code/NanobotSkills/timeline-memory/scripts/models.py#L198-L224) 已包含聚合级 `confidence`
 - 但当前 `project-turn` 写入主路径里，这些字段还没有稳定赋值策略：
-  - [build_raw_event()](file:///d:/Code/NanobotSkills/timeline-memory/scripts/timeline_cli.py#L331-L376) 当前只稳定写 `event_id / event_type / actor / raw_text / payload`
-  - [merge_event_refs()](file:///d:/Code/NanobotSkills/timeline-memory/scripts/timeline_cli.py#L185-L204) 当前只按“首条 `primary`、后续 `context`”生成最小引用关系
+  - [build_raw_event()](file:///d:/Code/NanobotSkills/timeline-memory/scripts/timeline_cli.py#L491-L540) 当前只稳定写 `event_id / event_type / actor / raw_text / payload`
+  - [merge_event_refs()](file:///d:/Code/NanobotSkills/timeline-memory/scripts/timeline_cli.py#L345-L364) 当前只按“首条 `primary`、后续 `context`”生成最小引用关系
 - 如果不先定义 M5，后续查询增强、跨轮归因与证据链展示都会建立在不稳定的隐式约定上
 
 设计结论：
@@ -610,8 +610,8 @@
 当前实现观察：
 
 - 当前 raw event 序列化结构已经支持上述字段，但 `project-turn` 入口没有赋值逻辑，因此历史数据会大量留空，见 [models.py](file:///d:/Code/NanobotSkills/timeline-memory/scripts/models.py#L49-L97)
-- 当前 thread 引用关系只表达“当前轮第一个事件是 `primary`，其余是 `context`”，这对单轮写入已经足够，但还没有把它上升为公开稳定规则，见 [merge_event_refs()](file:///d:/Code/NanobotSkills/timeline-memory/scripts/timeline_cli.py#L185-L204)
-- 当前 replay 判定依赖 `_timeline_memory.turn_id / fingerprint / role / thread_id`，M5 需要确保 raw event 构造新增的语义字段不会破坏现有幂等与恢复判断，见 [build_raw_event()](file:///d:/Code/NanobotSkills/timeline-memory/scripts/timeline_cli.py#L331-L376) 与 [ensure_replay_metadata_matches()](file:///d:/Code/NanobotSkills/timeline-memory/scripts/timeline_cli.py#L307-L324)
+- 当前 thread 引用关系只表达“当前轮第一个事件是 `primary`，其余是 `context`”，这对单轮写入已经足够，但还没有把它上升为公开稳定规则，见 [merge_event_refs()](file:///d:/Code/NanobotSkills/timeline-memory/scripts/timeline_cli.py#L345-L364)
+- 当前 replay 判定依赖 `_timeline_memory.turn_id / fingerprint / role / thread_id`，M5 需要确保 raw event 构造新增的语义字段不会破坏现有幂等与恢复判断，见 [build_raw_event()](file:///d:/Code/NanobotSkills/timeline-memory/scripts/timeline_cli.py#L491-L540) 与 [ensure_replay_metadata_matches()](file:///d:/Code/NanobotSkills/timeline-memory/scripts/timeline_cli.py#L473-L488)
 - 当前 schema 文档对 `ThreadEventRef.role` 只列了枚举值，没有定义“谁来写、何时写、哪些命令会产生哪些 role”，这是 M5 首先要补齐的合同缺口，见 [schema.md](file:///d:/Code/NanobotSkills/timeline-memory/references/schema.md#L197-L220)
 
 推荐落地顺序：
@@ -664,12 +664,12 @@
 当前实现状态：
 
 - 已完成 M5 第一版最小写入实现：
-  - [build_raw_event()](file:///d:/Code/NanobotSkills/timeline-memory/scripts/timeline_cli.py#L331-L381) 已稳定写入：
+  - [build_raw_event()](file:///d:/Code/NanobotSkills/timeline-memory/scripts/timeline_cli.py#L491-L540) 已稳定写入：
     - inbound / outbound `correlation_id = turn_id`
     - inbound `causation_id = None`
     - outbound `causation_id = build_event_id(turn_id, "inbound")`
     - `confidence` 保持为空
-  - [merge_event_refs()](file:///d:/Code/NanobotSkills/timeline-memory/scripts/timeline_cli.py#L185-L204) 已通过 [project_turn_event_ref_role()](file:///d:/Code/NanobotSkills/timeline-memory/scripts/timeline_cli.py#L383-L384) 显式固化当前 turn 的 `primary/context` 规则
+  - [merge_event_refs()](file:///d:/Code/NanobotSkills/timeline-memory/scripts/timeline_cli.py#L345-L364) 已通过 [project_turn_event_ref_role()](file:///d:/Code/NanobotSkills/timeline-memory/scripts/timeline_cli.py#L543-L544) 显式固化当前 turn 的 `primary/context` 规则
 - 已完成回归覆盖：
   - [test_timeline_cli_e2e.py](file:///d:/Code/NanobotSkills/timeline-memory/tests/timeline/test_timeline_cli_e2e.py) 已覆盖首次写入、幂等重放、partial write repair、txn recovery 下的字段稳定性
   - [selftest.py](file:///d:/Code/NanobotSkills/timeline-memory/scripts/selftest.py) 已补最小冒烟，验证单 turn 语义在 repair 路径上保持一致
@@ -704,9 +704,9 @@
 为什么现在做 M6：
 
 - M3 并发写入、M4 错误模型、M5 事件语义都已完成第一版闭环；当前短板已从“如何稳定写入”转为“如何在数据增长后稳定读取”
-- 当前 `list-threads` 公开能力仍只支持 `--thread-kind` / `--status` 两个过滤条件，见 [timeline_cli.py](file:///d:/Code/NanobotSkills/timeline-memory/scripts/timeline_cli.py#L957-L960) 与 [timeline_cli.py](file:///d:/Code/NanobotSkills/timeline-memory/scripts/timeline_cli.py#L1208-L1213)
+- 当前 `list-threads` 公开能力仍只支持 `--thread-kind` / `--status` 两个过滤条件，见 [timeline_cli.py](file:///d:/Code/NanobotSkills/timeline-memory/scripts/timeline_cli.py#L1117-L1155) 与 [timeline_cli.py](file:///d:/Code/NanobotSkills/timeline-memory/scripts/timeline_cli.py#L1406-L1415)
 - 当前 `schema.md` 中 `list-threads` 的公开合同也还只有最小输入输出描述，尚未覆盖分页、时间窗口与检索边界，见 [schema.md](file:///d:/Code/NanobotSkills/timeline-memory/references/schema.md#L123-L142)
-- 当前底层排序规则已经稳定为“按 `last_event_at`、再按 `updated_at` 倒序”，且已有跨时区排序回归；这为在不改存储模型的前提下继续扩查询合同提供了基础，见 [store.py](file:///d:/Code/NanobotSkills/timeline-memory/scripts/store.py#L537-L560) 与 [test_timeline_cli_e2e.py](file:///d:/Code/NanobotSkills/timeline-memory/tests/timeline/test_timeline_cli_e2e.py#L1223-L1276)
+- 当前底层排序规则已经稳定为“按 `last_event_at`、再按 `updated_at` 倒序”，且已有跨时区排序回归；这为在不改存储模型的前提下继续扩查询合同提供了基础，见 [store.py](file:///d:/Code/NanobotSkills/timeline-memory/scripts/store.py#L545-L583) 与 [test_timeline_cli_e2e.py:L1252-L1278](file:///d:/Code/NanobotSkills/timeline-memory/tests/timeline/test_timeline_cli_e2e.py#L1252-L1278)
 
 设计结论：
 
@@ -755,7 +755,8 @@
   - [schema.md](file:///d:/Code/NanobotSkills/timeline-memory/references/schema.md) 与 [SKILL.md](file:///d:/Code/NanobotSkills/timeline-memory/SKILL.md) 已同步 M6 第一版合同
 - 当前结论：
   - M6 P1 / P2 / P3 / P5 已完成第一版闭环
-  - M6 P4 中文本检索继续后置，不纳入当前提交范围
+  - M6 P4 中文本检索继续后置，不纳入 M6 第一版完成范围
+  - M6 第一版应视为“已完成并可关闭”，后续不要再以“补完 M6”为名继续扩查询合同
 
 当前实现观察：
 
@@ -771,32 +772,32 @@
   - 最后按 `last_event_at`、`updated_at`、`thread_id` 倒序返回
   - 见 [store.py](file:///d:/Code/NanobotSkills/timeline-memory/scripts/store.py)
 - 当前已有稳定时间排序基础设施 [timestamp_sort_key()](file:///d:/Code/NanobotSkills/timeline-memory/scripts/time_utils.py#L20-L27)，并已有“跨 offset 绝对时间排序”回归覆盖
-- 当前未完成项已不再是分页与时间窗口，而是是否继续把文本检索纳入 M6 第一版
+- 当前交接判断：
+  - M6 已经没有必须继续推进的剩余项
+  - 若未来确实出现搜索需求，应新开独立里程碑，而不是回到 M6 继续扩张完成定义
 
-推荐落地顺序：
+交接建议：
 
-- 第一段：文本检索评估
-  - 只做可选最小匹配能力
-  - 明确匹配字段范围、大小写策略与与现有过滤条件的组合语义
-  - 若发现合同复杂度过高，可把文本检索拆到后续里程碑
-- 第二段：M6 收口
-  - 若文本检索继续后置，则直接以“分页 + 时间窗口 + 合同同步”收口 M6
-  - 若文本检索纳入，则补 CLI E2E、自测与公开合同
+- 对后续接手者：
+  - 不要再在 M6 下增加文本检索、模糊时间、相关性排序等查询能力
+  - 如要做搜索，请新开里程碑并单独定义输入输出合同、匹配字段与排序语义
+  - 当前 M6 更适合作为稳定基线，被后续里程碑复用而不是继续扩写
 
-下一步最高价值计划：
+当前阶段结论：
 
 - 目标
-  - 决定文本检索是否仍属于 M6 第一版
-  - 若不纳入，则直接把 M6 视为已完成并转入下一个里程碑
+  - 将 M6 作为已完成里程碑封板
+  - 把后续推进重心切到 M7 或新的功能性里程碑
 
-- 为什么优先做这一步
-  - 分页与时间窗口已经实现并完成合同同步，当前唯一剩余变量是文本检索是否值得继续放在 M6
-  - 如果继续把文本检索塞进 M6，合同复杂度会再次上升；应先判断收益是否足以覆盖新增复杂度
+- 为什么这么收口
+  - 分页、时间窗口、错误边界、兼容输出与合同同步都已经完成
+  - 文本检索会显著扩大公开查询合同，不再适合作为 M6 第一版的尾项
+  - 对其他人而言，最重要的是知道“这里已经稳定，可以停止继续往里加需求”
 
-- 第一版实施范围
-  - 只修改 `list-threads`
-  - 先不改 `get-thread` / `list-thread-history`
-  - 先不引入搜索索引或缓存
+- 已完成范围
+  - 只修改了 `list-threads`
+  - 未改 `get-thread` / `list-thread-history`
+  - 未引入搜索索引或缓存
   - 默认成功输出继续保持 thread 数组；分页包装只在显式分页模式下返回
 
 - 参数与合同建议
@@ -830,15 +831,15 @@
 
 - 代码落点
   - CLI 参数层：
-    - [timeline_cli.py](file:///d:/Code/NanobotSkills/timeline-memory/scripts/timeline_cli.py#L1208-L1213)
+    - [timeline_cli.py](file:///d:/Code/NanobotSkills/timeline-memory/scripts/timeline_cli.py#L1406-L1415)
   - 查询入口：
-    - [cmd_list_threads()](file:///d:/Code/NanobotSkills/timeline-memory/scripts/timeline_cli.py#L957-L960)
+    - [cmd_list_threads()](file:///d:/Code/NanobotSkills/timeline-memory/scripts/timeline_cli.py#L1117-L1155)
   - 底层过滤与排序：
-    - [store.list_threads()](file:///d:/Code/NanobotSkills/timeline-memory/scripts/store.py#L537-L560)
+    - [store.list_threads()](file:///d:/Code/NanobotSkills/timeline-memory/scripts/store.py#L545-L583)
   - 时间比较基础：
     - [time_utils.py](file:///d:/Code/NanobotSkills/timeline-memory/scripts/time_utils.py#L1-L27)
 
-- 测试计划
+- 已完成测试回顾
   - 分页：
     - `limit` 生效
     - `next_cursor` 可继续取下一页
@@ -849,7 +850,7 @@
     - 跨时区时间值过滤结果稳定
     - 过滤后分页仍不漂移
   - 文本检索：
-    - 仅在进入实现时再补对应最小断言，不提前把范围写宽
+    - 未纳入 M6 第一版，本轮未补对应断言
 
 - 分步实现计划
   - P1：分页合同定稿（已完成）
@@ -860,9 +861,9 @@
   - P3：时间窗口过滤（已完成）
     - 已增加结构化时间过滤参数与回归
     - 已保证与分页组合后结果稳定
-  - P4：评估文本检索是否留在 M6 第一版
-    - 若语义简单且不扩大合同复杂度，则纳入
-    - 否则把文本检索下沉为后续里程碑，先收 M6 前三段
+  - P4：文本检索评估（已收口为后置）
+    - 结论：不纳入 M6 第一版
+    - 处理：若未来需要，单开新里程碑继续推进
   - P5：公开合同同步（已完成）
     - 已更新 `schema.md` 与 `SKILL.md`
     - 已明确分页对象、过滤参数与仍未开放的查询能力
@@ -899,19 +900,19 @@
 
 当前热点：
 
-- [test_project_turn_stage_recovery_then_replay_matches_reference_state](file:///d:/Code/NanobotSkills/timeline-memory/tests/timeline/test_timeline_cli_e2e.py#L707-L774)
+- [test_project_turn_stage_recovery_then_replay_matches_reference_state](file:///d:/Code/NanobotSkills/timeline-memory/tests/timeline/test_timeline_cli_e2e.py#L897-L1032)
   - 单测约 `2.76s` 到 `2.92s`
   - 每个参数化 case 约触发 `12` 次 CLI 子进程
-- [test_project_turn_repeated_recovery_from_snapshot_committed_txn_keeps_single_history_entry](file:///d:/Code/NanobotSkills/timeline-memory/tests/timeline/test_timeline_cli_e2e.py#L448-L515)
+- [test_project_turn_repeated_recovery_from_snapshot_committed_txn_keeps_single_history_entry](file:///d:/Code/NanobotSkills/timeline-memory/tests/timeline/test_timeline_cli_e2e.py#L639-L771)
   - 单测约 `2.38s`
   - 约触发 `9` 次 CLI 子进程
-- [test_project_turn_repeated_recovery_from_history_committed_txn_keeps_single_history_entry](file:///d:/Code/NanobotSkills/timeline-memory/tests/timeline/test_timeline_cli_e2e.py#L582-L652)
+- [test_project_turn_repeated_recovery_from_history_committed_txn_keeps_single_history_entry](file:///d:/Code/NanobotSkills/timeline-memory/tests/timeline/test_timeline_cli_e2e.py#L773-L895)
   - 单测约 `2.29s`
   - 约触发 `9` 次 CLI 子进程
-- [test_source_normalization_and_partial_write_recovery](file:///d:/Code/NanobotSkills/timeline-memory/tests/timeline/test_timeline_cli_e2e.py#L845-L922)
+- [test_source_normalization_and_partial_write_recovery](file:///d:/Code/NanobotSkills/timeline-memory/tests/timeline/test_timeline_cli_e2e.py#L1034-L1118)
   - 单测约 `2.22s`
   - 约触发 `8` 次 CLI 子进程
-- [test_host_adapter_e2e_write_and_read_contract](file:///d:/Code/NanobotSkills/timeline-memory/tests/agent/test_timeline_memory_skill_integration.py#L120-L139)
+- [test_host_adapter_e2e_write_and_read_contract](file:///d:/Code/NanobotSkills/timeline-memory/tests/agent/test_timeline_memory_skill_integration.py#L160-L180)
   - 单测约 `1.02s`
   - 约触发 `4` 次 CLI 子进程
 
@@ -920,11 +921,11 @@
 - 当前热点测试大多不是单次业务逻辑特别重，而是同一测试内反复调用 CLI
 - 测试 helper 当前主要通过子进程调用 CLI，见：
   - [conftest.py](file:///d:/Code/NanobotSkills/timeline-memory/tests/conftest.py#L37-L79)
-  - [test_timeline_memory_skill_integration.py](file:///d:/Code/NanobotSkills/timeline-memory/tests/agent/test_timeline_memory_skill_integration.py#L66-L93)
-- `_assert_turn_state_matches_reference()` 每次会额外触发 `4` 次 CLI 读取，见 [test_timeline_cli_e2e.py](file:///d:/Code/NanobotSkills/timeline-memory/tests/timeline/test_timeline_cli_e2e.py#L78-L107)
+  - [test_timeline_memory_skill_integration.py](file:///d:/Code/NanobotSkills/timeline-memory/tests/agent/test_timeline_memory_skill_integration.py#L30-L96)
+- `_assert_turn_state_matches_reference()` 每次会额外触发 `4` 次 CLI 读取，见 [test_timeline_cli_e2e.py](file:///d:/Code/NanobotSkills/timeline-memory/tests/timeline/test_timeline_cli_e2e.py#L154-L193)
 - 当前日常命令还叠加了 `pytest`、`selftest.py`、`run-host-tests.py` 三层入口，存在明显重复覆盖
 
-P1 当前进展：
+P1 阶段回顾：
 
 - 已完成：
   - [conftest.py](file:///d:/Code/NanobotSkills/timeline-memory/tests/conftest.py) 中的 `CliRunner` 已优先使用当前解释器直启 CLI，仅在当前解释器不可用时回退到 `uv run python`
@@ -943,16 +944,16 @@ P1 当前进展：
     - 优化前约 `53.252s`
     - 优化后约 `44.509s`
     - 下降约 `16.42%`
-  - 当前判断：
+  - 阶段结论：
     - `selftest.py` 与 `run-host-tests.py` 已获得稳定收益
-    - 三文件 pytest 尚未达到“至少下降 `20%`”的验收线，需要继续推进 P2 / P3
+    - P1 单独落地时，三文件 pytest 尚未达到“至少下降 `20%`”的验收线；后续已由 P2 / P3 继续完成收口
 
-P2 当前进展：
+P2 阶段回顾：
 
 - 已完成：
   - [conftest.py](file:///d:/Code/NanobotSkills/timeline-memory/tests/conftest.py) 中的 `CliRunner` 已切为进程内执行 `timeline_cli.main(argv)`
   - E2E 测试已不再为每次 `cli_runner.run_json()` / `cli_runner.expect_failure()` 额外启动真实子进程
-  - 宿主集成测试中的 [TimelineMemoryHostAdapter](file:///d:/Code/NanobotSkills/timeline-memory/tests/agent/test_timeline_memory_skill_integration.py#L24-L96) 仍保留真实 subprocess 路径，继续承担 CLI 合同冒烟角色
+  - 宿主集成测试中的 [TimelineMemoryHostAdapter](file:///d:/Code/NanobotSkills/timeline-memory/tests/agent/test_timeline_memory_skill_integration.py#L30-L96) 仍保留真实 subprocess 路径，继续承担 CLI 合同冒烟角色
 - P2 实测结果：
   - 三文件 pytest：
     - P1 后约 `46.714s`
@@ -973,12 +974,12 @@ P2 当前进展：
     - 个别复杂恢复场景本身的文件 IO / 状态构造
     - `scratch_root` 清理带来的 teardown 成本
     - 仍保留真实 subprocess 的宿主集成测试
-- 当前判断：
+- 阶段结论：
   - P2 已达到“显著压缩热点 E2E 子进程成本”的目标
-  - 三文件 pytest 与 `run-host-tests.py` 都已低于 M7 中设定的目标区间
-  - 下一步可以进入 P3，继续减少高频对照读取与 teardown 成本
+  - 三文件 pytest 与 `run-host-tests.py` 在 P2 后都已低于 M7 中设定的目标区间
+  - P3 随后继续用于减少高频对照读取与 teardown 成本
 
-P3 当前进展：
+P3 阶段回顾：
 
 - 已完成：
   - [test_timeline_cli_e2e.py](file:///d:/Code/NanobotSkills/timeline-memory/tests/timeline/test_timeline_cli_e2e.py) 中的 `_assert_turn_state_matches_reference()` 已改为直接读取 store 中的 snapshot / history 文件，不再走额外 CLI 查询
@@ -1004,11 +1005,11 @@ P3 当前进展：
     - `raw_committed` 恢复类用例本身
     - 宿主集成真实 subprocess 冒烟
     - Windows 下目录清理 teardown
-- 当前判断：
+- 阶段结论：
   - P3 已完成“减少高频对照读取并收缩部分复合场景成本”的目标
-  - 继续优化的边际收益开始下降，下一阶段更适合转向命令分层与回归入口整理
+  - 自 P3 起，继续优化的边际收益已明显下降，因此后续工作转向命令分层与回归入口整理
 
-P4 当前进展：
+P4 阶段回顾：
 
 - 已完成：
   - [SKILL.md](file:///d:/Code/NanobotSkills/timeline-memory/SKILL.md) 已按“日常开发回归 / 宿主级稳定性回归 / 发布前全量回归”三层入口重写测试说明
@@ -1025,11 +1026,11 @@ P4 当前进展：
     - `uv run --extra dev python -m pytest -q tests/timeline/test_store_primitives.py tests/timeline/test_timeline_cli_e2e.py tests/agent/test_timeline_memory_skill_integration.py`
     - `uv run python scripts/selftest.py`
     - `uv run python scripts/run-host-tests.py --rounds 3`
-- 当前判断：
+- 阶段结论：
   - P4 已完成“分层整理测试入口并明确边界”的目标
-  - 下一步主要剩余的是 P5：在文档中沉淀最终 profile 对比结论，收口本轮优化结果
+  - P5 随后已将最终 profile 对比结论沉淀进文档，完成本轮优化收口
 
-P5 当前进展：
+P5 阶段回顾：
 
 - 已完成：
   - 已在同一机器、同一命令口径下重新测量三文件 pytest、`selftest.py`、`run-host-tests.py` 与整条串行命令
@@ -1067,7 +1068,7 @@ P5 当前进展：
     - 已低于目标 `30s` 到 `35s`
   - 整条串行命令：
     - 已低于目标 `75s` 到 `90s`
-- 当前判断：
+- 最终判断：
   - M7 的核心目标已完成
   - 后续若继续优化，优先级应低于并发语义、错误模型等功能性里程碑
   - 剩余可优化项主要集中在：
@@ -1075,11 +1076,23 @@ P5 当前进展：
     - 少量仍保留真实 subprocess 的宿主冒烟
     - 个别 `raw_committed` 恢复场景本身的文件 IO 成本
 
-分步方案：
+交接建议：
+
+- 对后续接手者：
+  - 不要把 M7 当成当前主线继续深挖；M7 的核心收益已经拿到，继续优化的边际收益明显下降
+  - 只有在新功能开发再次被测试耗时阻塞时，才回到 M7 处理 teardown 或少量剩余 subprocess 热点
+  - 常规开发默认遵循当前已经落定的分层回归入口，不要重新把 `pytest`、`selftest.py`、`run-host-tests.py` 串起来重复跑
+- 后续方向建议：
+  - 新开功能性里程碑，而不是继续扩写 M6 / M7
+  - 候选方向优先级建议：
+    - 第一优先级：围绕 M5 事件语义开放新的高层查询能力，但单独定义里程碑与合同
+    - 第二优先级：若真实需求不足，则先保持当前功能面稳定，只做缺陷修复与小范围验证
+
+已完成分步回顾：
 
 - 第一步：收口测试子进程启动方式
   - 将测试 helper 中的 `uv run python ...` 优先替换为当前解释器直启
-  - 在已运行于 `uv run` 环境的测试进程内，优先使用 `sys.executable` 调用 [timeline_cli.py](file:///d:/Code/NanobotSkills/timeline-memory/scripts/timeline_cli.py#L984-L995)
+  - 在已运行于 `uv run` 环境的测试进程内，优先使用 `sys.executable` 调用 [timeline_cli.py](file:///d:/Code/NanobotSkills/timeline-memory/scripts/timeline_cli.py#L1432-L1442)
   - 保留“当前环境无 `pytest` 或无必要依赖时才回退到 `uv run`”的兜底逻辑
   - 当前状态：
     - 已完成当前解释器优先直启
@@ -1110,7 +1123,7 @@ P5 当前进展：
     - 至少保留一组真实 CLI 冒烟测试覆盖 `project-turn`、`get-thread`、`list-threads`、`list-thread-history`
 
 - 第三步：瘦身高频对照读取与复合场景
-  - 重新审视 [_assert_turn_state_matches_reference()](file:///d:/Code/NanobotSkills/timeline-memory/tests/timeline/test_timeline_cli_e2e.py#L78-L107) 的使用范围
+  - 重新审视 [_assert_turn_state_matches_reference()](file:///d:/Code/NanobotSkills/timeline-memory/tests/timeline/test_timeline_cli_e2e.py#L154-L193) 的使用范围
   - 对只验证最终存储收敛的场景，优先直接对 store 文件结构断言
   - 将“source normalization + partial write recovery”这类复合测试拆成更单一的断言路径
   - 将公共前置构造沉淀为 helper，避免每个测试重复做多轮读写
@@ -1145,7 +1158,7 @@ P5 当前进展：
     - 日常回归默认命令不再重复执行同一批 host/E2E
     - 文档中明确标注每个入口的用途与适用时机
 
-建议落地顺序：
+已完成执行顺序：
 
 - P1：先改测试 helper 的 CLI 启动方式
 - P2：补进程内 runner，并迁移恢复类热点测试
@@ -1153,7 +1166,7 @@ P5 当前进展：
 - P4：整理并发布新的测试命令分层
 - P5：重新 profile，并把前后对比结果回写文档
 
-建议目标：
+目标达成回顾：
 
 - 三文件 pytest：
   - 从约 `56.957s` 压到 `35s` 左右或更低
