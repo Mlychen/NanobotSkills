@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import json
 import os
 import shutil
@@ -109,6 +110,32 @@ def _write_thread_history(store_root: Path, thread_id: str, records: list[dict])
         "".join(json.dumps(record, ensure_ascii=False) + "\n" for record in records),
         encoding="utf-8",
     )
+
+
+def _thread_snapshot_payload(
+    *,
+    thread_id: str,
+    title: str,
+    status: str = "planned",
+    thread_kind: str = "task",
+    last_event_at: str | None,
+    updated_at: str,
+) -> dict:
+    return {
+        "thread_id": thread_id,
+        "thread_kind": thread_kind,
+        "title": title,
+        "status": status,
+        "plan_time": {},
+        "fact_time": {},
+        "content": {},
+        "event_refs": [],
+        "meta": {"created_by": "test", "updated_by": "test", "revision": 1},
+        "first_event_at": last_event_at,
+        "last_event_at": last_event_at,
+        "created_at": updated_at,
+        "updated_at": updated_at,
+    }
 
 
 def _build_inbound_raw_line(payload: dict, *, recorded_at: str = "2026-03-24T00:00:00+08:00") -> str:
@@ -1224,56 +1251,321 @@ def test_missing_snapshot_replay_preserves_multiturn_thread_state(cli_runner, sc
 
 def test_list_threads_orders_by_absolute_time_across_offsets(cli_runner, scratch_root: Path) -> None:
     store_root = scratch_root / "mixed-offset-order-store"
-    threads_dir = store_root / "threads"
-    threads_dir.mkdir(parents=True, exist_ok=True)
-    _thread_snapshot_path(store_root, "thr_late_utc").write_text(
-        json.dumps(
-            {
-                "thread_id": "thr_late_utc",
-                "thread_kind": "task",
-                "title": "late-utc",
-                "status": "planned",
-                "plan_time": {},
-                "fact_time": {},
-                "content": {},
-                "event_refs": [],
-                "meta": {"created_by": "test", "updated_by": "test", "revision": 1},
-                "first_event_at": "2026-03-24T09:00:00+00:00",
-                "last_event_at": "2026-03-24T09:00:00+00:00",
-                "created_at": "2026-03-24T09:00:00+00:00",
-                "updated_at": "2026-03-24T09:00:00+00:00",
-            },
-            ensure_ascii=False,
-            indent=2,
+    _write_thread_snapshot(
+        store_root,
+        "thr_late_utc",
+        _thread_snapshot_payload(
+            thread_id="thr_late_utc",
+            title="late-utc",
+            last_event_at="2026-03-24T09:00:00+00:00",
+            updated_at="2026-03-24T09:00:00+00:00",
         ),
-        encoding="utf-8",
     )
-    _thread_snapshot_path(store_root, "thr_early_hk").write_text(
-        json.dumps(
-            {
-                "thread_id": "thr_early_hk",
-                "thread_kind": "task",
-                "title": "early-hk",
-                "status": "planned",
-                "plan_time": {},
-                "fact_time": {},
-                "content": {},
-                "event_refs": [],
-                "meta": {"created_by": "test", "updated_by": "test", "revision": 1},
-                "first_event_at": "2026-03-24T10:00:00+08:00",
-                "last_event_at": "2026-03-24T10:00:00+08:00",
-                "created_at": "2026-03-24T10:00:00+08:00",
-                "updated_at": "2026-03-24T10:00:00+08:00",
-            },
-            ensure_ascii=False,
-            indent=2,
+    _write_thread_snapshot(
+        store_root,
+        "thr_early_hk",
+        _thread_snapshot_payload(
+            thread_id="thr_early_hk",
+            title="early-hk",
+            last_event_at="2026-03-24T10:00:00+08:00",
+            updated_at="2026-03-24T10:00:00+08:00",
         ),
-        encoding="utf-8",
     )
 
     threads = cli_runner.run_json(store_root, "list-threads")
 
     assert [thread["thread_id"] for thread in threads] == ["thr_late_utc", "thr_early_hk"]
+
+
+def test_list_threads_pagination_uses_wrapper_only_in_explicit_paging_mode(cli_runner, scratch_root: Path) -> None:
+    store_root = scratch_root / "list-threads-pagination-store"
+    _write_thread_snapshot(
+        store_root,
+        "thr_page_3",
+        _thread_snapshot_payload(
+            thread_id="thr_page_3",
+            title="page-3",
+            last_event_at="2026-03-24T11:00:00+00:00",
+            updated_at="2026-03-24T11:00:00+00:00",
+        ),
+    )
+    _write_thread_snapshot(
+        store_root,
+        "thr_page_2",
+        _thread_snapshot_payload(
+            thread_id="thr_page_2",
+            title="page-2",
+            last_event_at="2026-03-24T10:00:00+00:00",
+            updated_at="2026-03-24T10:00:00+00:00",
+        ),
+    )
+    _write_thread_snapshot(
+        store_root,
+        "thr_page_1",
+        _thread_snapshot_payload(
+            thread_id="thr_page_1",
+            title="page-1",
+            last_event_at="2026-03-24T09:00:00+00:00",
+            updated_at="2026-03-24T09:00:00+00:00",
+        ),
+    )
+
+    full_list = cli_runner.run_json(store_root, "list-threads")
+    first_page = cli_runner.run_json(store_root, "list-threads", args=["--limit", "2"])
+
+    assert [thread["thread_id"] for thread in full_list] == ["thr_page_3", "thr_page_2", "thr_page_1"]
+    assert [thread["thread_id"] for thread in first_page["items"]] == ["thr_page_3", "thr_page_2"]
+    assert first_page["has_more"] is True
+    assert isinstance(first_page["next_cursor"], str) and first_page["next_cursor"]
+
+    second_page = cli_runner.run_json(
+        store_root,
+        "list-threads",
+        args=["--limit", "2", "--cursor", first_page["next_cursor"]],
+    )
+
+    assert [thread["thread_id"] for thread in second_page["items"]] == ["thr_page_1"]
+    assert second_page["has_more"] is False
+    assert second_page["next_cursor"] is None
+
+
+def test_list_threads_filters_last_event_window_and_paginates_filtered_result(cli_runner, scratch_root: Path) -> None:
+    store_root = scratch_root / "list-threads-time-window-store"
+    _write_thread_snapshot(
+        store_root,
+        "thr_window_after",
+        _thread_snapshot_payload(
+            thread_id="thr_window_after",
+            title="window-after",
+            last_event_at="2026-03-24T11:00:00+00:00",
+            updated_at="2026-03-24T11:00:00+00:00",
+        ),
+    )
+    _write_thread_snapshot(
+        store_root,
+        "thr_window_mid",
+        _thread_snapshot_payload(
+            thread_id="thr_window_mid",
+            title="window-mid",
+            last_event_at="2026-03-24T10:00:00+00:00",
+            updated_at="2026-03-24T10:00:00+00:00",
+        ),
+    )
+    _write_thread_snapshot(
+        store_root,
+        "thr_window_start",
+        _thread_snapshot_payload(
+            thread_id="thr_window_start",
+            title="window-start",
+            last_event_at="2026-03-24T09:00:00+00:00",
+            updated_at="2026-03-24T09:00:00+00:00",
+        ),
+    )
+    _write_thread_snapshot(
+        store_root,
+        "thr_window_missing",
+        _thread_snapshot_payload(
+            thread_id="thr_window_missing",
+            title="window-missing",
+            last_event_at=None,
+            updated_at="2026-03-24T12:00:00+00:00",
+        ),
+    )
+
+    filtered = cli_runner.run_json(
+        store_root,
+        "list-threads",
+        args=[
+            "--last-event-at-or-after",
+            "2026-03-24T09:00:00+00:00",
+            "--last-event-at-or-before",
+            "2026-03-24T10:00:00+00:00",
+        ],
+    )
+    first_page = cli_runner.run_json(
+        store_root,
+        "list-threads",
+        args=[
+            "--last-event-at-or-after",
+            "2026-03-24T09:00:00+00:00",
+            "--last-event-at-or-before",
+            "2026-03-24T10:00:00+00:00",
+            "--limit",
+            "1",
+        ],
+    )
+
+    assert [thread["thread_id"] for thread in filtered] == ["thr_window_mid", "thr_window_start"]
+    assert [thread["thread_id"] for thread in first_page["items"]] == ["thr_window_mid"]
+    assert first_page["has_more"] is True
+
+    second_page = cli_runner.run_json(
+        store_root,
+        "list-threads",
+        args=[
+            "--last-event-at-or-after",
+            "2026-03-24T09:00:00+00:00",
+            "--last-event-at-or-before",
+            "2026-03-24T10:00:00+00:00",
+            "--limit",
+            "1",
+            "--cursor",
+            first_page["next_cursor"],
+        ],
+    )
+
+    assert [thread["thread_id"] for thread in second_page["items"]] == ["thr_window_start"]
+    assert second_page["has_more"] is False
+
+
+def test_list_threads_invalid_paging_arguments_return_invalid_argument(cli_runner, scratch_root: Path) -> None:
+    store_root = scratch_root / "list-threads-invalid-args-store"
+    _write_thread_snapshot(
+        store_root,
+        "thr_invalid_cursor_2",
+        _thread_snapshot_payload(
+            thread_id="thr_invalid_cursor_2",
+            title="invalid-cursor-2",
+            status="planned",
+            last_event_at="2026-03-24T10:00:00+00:00",
+            updated_at="2026-03-24T10:00:00+00:00",
+        ),
+    )
+    _write_thread_snapshot(
+        store_root,
+        "thr_invalid_cursor_1",
+        _thread_snapshot_payload(
+            thread_id="thr_invalid_cursor_1",
+            title="invalid-cursor-1",
+            status="planned",
+            last_event_at="2026-03-24T09:00:00+00:00",
+            updated_at="2026-03-24T09:00:00+00:00",
+        ),
+    )
+    first_page = cli_runner.run_json(store_root, "list-threads", args=["--status", "planned", "--limit", "1"])
+
+    invalid_limit = cli_runner.expect_failure_json(store_root, "list-threads", args=["--limit", "0"])
+    invalid_cursor = cli_runner.expect_failure_json(store_root, "list-threads", args=["--cursor", "not-a-cursor"])
+    invalid_window = cli_runner.expect_failure_json(
+        store_root,
+        "list-threads",
+        args=[
+            "--last-event-at-or-after",
+            "2026-03-24T10:00:00+00:00",
+            "--last-event-at-or-before",
+            "2026-03-24T09:00:00+00:00",
+        ],
+    )
+    mismatched_cursor = cli_runner.expect_failure_json(
+        store_root,
+        "list-threads",
+        args=["--status", "done", "--limit", "1", "--cursor", first_page["next_cursor"]],
+    )
+    cursor_padding = "=" * (-len(first_page["next_cursor"]) % 4)
+    decoded_cursor = json.loads(
+        base64.urlsafe_b64decode(f"{first_page['next_cursor']}{cursor_padding}").decode("utf-8")
+    )
+    decoded_cursor["position"]["updated_at"] = "not-a-timestamp"
+    tampered_updated_at_cursor = base64.urlsafe_b64encode(
+        json.dumps(decoded_cursor, ensure_ascii=False, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    ).decode("ascii").rstrip("=")
+    invalid_cursor_timestamp = cli_runner.expect_failure_json(
+        store_root,
+        "list-threads",
+        args=["--status", "planned", "--limit", "1", "--cursor", tampered_updated_at_cursor],
+    )
+    decoded_cursor["position"]["updated_at"] = "2026-03-24T10:00:00+00:00"
+    decoded_cursor["position"]["last_event_at"] = "not-a-timestamp"
+    tampered_last_event_at_cursor = base64.urlsafe_b64encode(
+        json.dumps(decoded_cursor, ensure_ascii=False, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    ).decode("ascii").rstrip("=")
+    invalid_last_event_at_cursor = cli_runner.expect_failure_json(
+        store_root,
+        "list-threads",
+        args=["--status", "planned", "--limit", "1", "--cursor", tampered_last_event_at_cursor],
+    )
+
+    assert invalid_limit["error"]["code"] == "TM_INVALID_ARGUMENT"
+    assert "limit must be a positive integer" in invalid_limit["error"]["message"]
+    assert invalid_cursor["error"]["code"] == "TM_INVALID_ARGUMENT"
+    assert "cursor is invalid" in invalid_cursor["error"]["message"]
+    assert invalid_window["error"]["code"] == "TM_INVALID_ARGUMENT"
+    assert "last_event_at_or_after must be <=" in invalid_window["error"]["message"]
+    assert mismatched_cursor["error"]["code"] == "TM_INVALID_ARGUMENT"
+    assert "cursor does not match current filters" in mismatched_cursor["error"]["message"]
+    assert invalid_cursor_timestamp["error"]["code"] == "TM_INVALID_ARGUMENT"
+    assert "cursor is invalid" in invalid_cursor_timestamp["error"]["message"]
+    assert invalid_last_event_at_cursor["error"]["code"] == "TM_INVALID_ARGUMENT"
+    assert "cursor is invalid" in invalid_last_event_at_cursor["error"]["message"]
+
+
+def test_real_cli_invalid_cursor_keeps_stderr_as_single_json(
+    cli_path: Path,
+    repo_root: Path,
+    cli_runner,
+    scratch_root: Path,
+) -> None:
+    store_root = scratch_root / "list-threads-real-cli-invalid-cursor-store"
+    _write_thread_snapshot(
+        store_root,
+        "thr_real_cli_invalid_cursor_2",
+        _thread_snapshot_payload(
+            thread_id="thr_real_cli_invalid_cursor_2",
+            title="real-cli-invalid-cursor-2",
+            status="planned",
+            last_event_at="2026-03-24T10:00:00+00:00",
+            updated_at="2026-03-24T10:00:00+00:00",
+        ),
+    )
+    _write_thread_snapshot(
+        store_root,
+        "thr_real_cli_invalid_cursor_1",
+        _thread_snapshot_payload(
+            thread_id="thr_real_cli_invalid_cursor_1",
+            title="real-cli-invalid-cursor-1",
+            status="planned",
+            last_event_at="2026-03-24T09:00:00+00:00",
+            updated_at="2026-03-24T09:00:00+00:00",
+        ),
+    )
+    first_page = cli_runner.run_json(store_root, "list-threads", args=["--status", "planned", "--limit", "1"])
+    cursor_padding = "=" * (-len(first_page["next_cursor"]) % 4)
+    decoded_cursor = json.loads(
+        base64.urlsafe_b64decode(f"{first_page['next_cursor']}{cursor_padding}").decode("utf-8")
+    )
+    decoded_cursor["position"]["updated_at"] = "not-a-timestamp"
+    tampered_cursor = base64.urlsafe_b64encode(
+        json.dumps(decoded_cursor, ensure_ascii=False, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    ).decode("ascii").rstrip("=")
+
+    result = subprocess.run(
+        [
+            *_resolve_python_command(),
+            str(cli_path),
+            "list-threads",
+            "--store-root",
+            str(store_root),
+            "--status",
+            "planned",
+            "--limit",
+            "1",
+            "--cursor",
+            tampered_cursor,
+        ],
+        cwd=repo_root,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        env=_real_cli_env(scratch_root),
+        check=False,
+    )
+
+    assert result.returncode == 1
+    assert result.stdout.strip() == ""
+    error = json.loads(result.stderr)
+    assert error["error"]["code"] == "TM_INVALID_ARGUMENT"
+    assert error["error"]["message"] == "list-threads cursor is invalid"
 
 
 def test_project_turn_rejects_context_recorded_at(cli_runner, scratch_root: Path) -> None:

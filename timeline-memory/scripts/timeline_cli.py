@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 import logging
 import os
@@ -32,13 +33,17 @@ from store import (  # noqa: E402
     StoreWriteBusyError,
     TimelineStore,
     VALID_JSONL_READ_MODES,
+    thread_listing_sort_key,
 )
+from time_utils import parse_optional_timestamp  # noqa: E402
 logging.basicConfig(level=logging.WARNING)
 
 TIMELINE_META_KEY = "_timeline_memory"
 DEFAULT_SOURCE = "skill://timeline-memory"
 DEFAULT_USER_ACTOR_ID = "user"
 DEFAULT_ASSISTANT_ACTOR_ID = "assistant"
+DEFAULT_LIST_THREADS_PAGE_SIZE = 100
+MAX_LIST_THREADS_PAGE_SIZE = 200
 JSONL_READ_ERROR_PATTERN = re.compile(r"^failed to read JSONL: (?P<path>.+) line (?P<line_no>\d+): (?P<reason>.+)$")
 INPUT_JSON_ERROR_PATTERN = re.compile(
     r"^failed to parse input JSON: (?P<path>.+) line (?P<line_no>\d+) column (?P<column_no>\d+): (?P<reason>.+)$"
@@ -102,6 +107,161 @@ def emit_error(error: TimelineCliError) -> int:
     sys.stderr.write(json.dumps(error.to_dict(), ensure_ascii=False, indent=2))
     sys.stderr.write("\n")
     return 1
+
+
+def _parse_list_threads_limit(raw: str | None) -> int | None:
+    if raw is None:
+        return None
+    try:
+        limit = int(raw)
+    except ValueError as exc:
+        raise ValueError("list-threads limit must be a positive integer") from exc
+    if limit <= 0:
+        raise ValueError("list-threads limit must be a positive integer")
+    if limit > MAX_LIST_THREADS_PAGE_SIZE:
+        raise ValueError(f"list-threads limit must be <= {MAX_LIST_THREADS_PAGE_SIZE}")
+    return limit
+
+
+def _parse_list_threads_timestamp(raw: str | None, *, field_name: str) -> datetime | None:
+    if raw is None:
+        return None
+    parsed = parse_optional_timestamp(raw, context=field_name, emit_warning=False)
+    if parsed is None:
+        raise ValueError(f"list-threads {field_name} must be a valid ISO 8601 timestamp")
+    return parsed
+
+
+def _normalize_list_threads_filters(
+    *,
+    thread_kind: str | None,
+    status: str | None,
+    last_event_at_or_after: datetime | None,
+    last_event_at_or_before: datetime | None,
+) -> dict[str, str | None]:
+    return {
+        "thread_kind": thread_kind,
+        "status": status,
+        "last_event_at_or_after": last_event_at_or_after.isoformat() if last_event_at_or_after is not None else None,
+        "last_event_at_or_before": last_event_at_or_before.isoformat() if last_event_at_or_before is not None else None,
+    }
+
+
+def _encode_list_threads_cursor(payload: dict[str, Any]) -> str:
+    encoded = base64.urlsafe_b64encode(
+        json.dumps(payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    )
+    return encoded.decode("ascii").rstrip("=")
+
+
+def _decode_list_threads_cursor(raw: str) -> dict[str, Any]:
+    try:
+        padding = "=" * (-len(raw) % 4)
+        decoded = base64.urlsafe_b64decode(f"{raw}{padding}".encode("ascii"))
+        payload = json.loads(decoded.decode("utf-8"))
+    except Exception as exc:
+        raise ValueError("list-threads cursor is invalid") from exc
+    if not isinstance(payload, dict):
+        raise ValueError("list-threads cursor is invalid")
+    return payload
+
+
+def _thread_cursor_payload(record: ThreadRecord) -> dict[str, Any]:
+    return {
+        "last_event_at": record.last_event_at,
+        "updated_at": record.updated_at,
+        "thread_id": record.thread_id,
+    }
+
+
+def _require_valid_cursor_timestamp(raw: str | None, *, field_name: str, required: bool) -> str | None:
+    if raw is None:
+        if required:
+            raise ValueError("list-threads cursor is invalid")
+        return None
+    if not isinstance(raw, str) or not raw:
+        raise ValueError("list-threads cursor is invalid")
+    if parse_optional_timestamp(
+        raw,
+        context=f"list-threads cursor {field_name}",
+        emit_warning=False,
+    ) is None:
+        raise ValueError("list-threads cursor is invalid")
+    return raw
+
+
+def _validate_list_threads_cursor(
+    raw: str,
+    *,
+    filters: dict[str, str | None],
+) -> tuple[tuple[tuple[bool, float], tuple[bool, float], str], dict[str, Any]]:
+    payload = _decode_list_threads_cursor(raw)
+    if payload.get("v") != 1:
+        raise ValueError("list-threads cursor is invalid")
+    position = payload.get("position")
+    if not isinstance(position, dict):
+        raise ValueError("list-threads cursor is invalid")
+    thread_id = position.get("thread_id")
+    if not isinstance(thread_id, str) or not thread_id:
+        raise ValueError("list-threads cursor is invalid")
+    updated_at = _require_valid_cursor_timestamp(
+        position.get("updated_at"),
+        field_name="updated_at",
+        required=True,
+    )
+    last_event_at = _require_valid_cursor_timestamp(
+        position.get("last_event_at"),
+        field_name="last_event_at",
+        required=False,
+    )
+    record = ThreadRecord(
+        thread_id=thread_id,
+        thread_kind="cursor",
+        title="cursor",
+        status="cursor",
+        plan_time=ThreadPlanTime(),
+        fact_time=ThreadFactTime(),
+        content=ThreadContent(),
+        event_refs=[],
+        meta=ThreadMeta(created_by="cursor", updated_by="cursor"),
+        first_event_at=None,
+        last_event_at=last_event_at,
+        created_at="1970-01-01T00:00:00+00:00",
+        updated_at=updated_at,
+    )
+    cursor_filters = payload.get("filters")
+    if cursor_filters != filters:
+        raise ValueError("list-threads cursor does not match current filters")
+    return thread_listing_sort_key(record), payload
+
+
+def _paginate_list_threads(
+    records: list[ThreadRecord],
+    *,
+    limit: int,
+    cursor: str | None,
+    filters: dict[str, str | None],
+) -> dict[str, Any]:
+    filtered_records = records
+    if cursor is not None:
+        cursor_key, _ = _validate_list_threads_cursor(cursor, filters=filters)
+        filtered_records = [record for record in records if thread_listing_sort_key(record) < cursor_key]
+    items = filtered_records[:limit]
+    has_more = len(filtered_records) > limit
+    next_cursor = None
+    if has_more and items:
+        next_cursor = _encode_list_threads_cursor(
+            {
+                "v": 1,
+                "filters": filters,
+                "position": _thread_cursor_payload(items[-1]),
+            }
+        )
+    return {
+        "items": [record.to_dict() for record in items],
+        "next_cursor": next_cursor,
+        "has_more": has_more,
+    }
 
 
 def build_store(args: argparse.Namespace) -> TimelineStore:
@@ -956,8 +1116,43 @@ def cmd_get_thread(args: argparse.Namespace) -> int:
 
 def cmd_list_threads(args: argparse.Namespace) -> int:
     store = build_store(args)
-    records = store.list_threads(thread_kind=args.thread_kind, status=args.status)
-    return emit_json([record.to_dict() for record in records])
+    pagination_mode = args.limit is not None or args.cursor is not None
+    limit = _parse_list_threads_limit(args.limit)
+    last_event_at_or_after = _parse_list_threads_timestamp(
+        args.last_event_at_or_after,
+        field_name="last_event_at_or_after",
+    )
+    last_event_at_or_before = _parse_list_threads_timestamp(
+        args.last_event_at_or_before,
+        field_name="last_event_at_or_before",
+    )
+    if (
+        last_event_at_or_after is not None
+        and last_event_at_or_before is not None
+        and last_event_at_or_after > last_event_at_or_before
+    ):
+        raise ValueError("list-threads last_event_at_or_after must be <= last_event_at_or_before")
+    records = store.list_threads(
+        thread_kind=args.thread_kind,
+        status=args.status,
+        last_event_at_or_after=last_event_at_or_after,
+        last_event_at_or_before=last_event_at_or_before,
+    )
+    if not pagination_mode:
+        return emit_json([record.to_dict() for record in records])
+    filters = _normalize_list_threads_filters(
+        thread_kind=args.thread_kind,
+        status=args.status,
+        last_event_at_or_after=last_event_at_or_after,
+        last_event_at_or_before=last_event_at_or_before,
+    )
+    page = _paginate_list_threads(
+        records,
+        limit=limit or DEFAULT_LIST_THREADS_PAGE_SIZE,
+        cursor=args.cursor,
+        filters=filters,
+    )
+    return emit_json(page)
 
 
 def cmd_list_thread_history(args: argparse.Namespace) -> int:
@@ -1103,6 +1298,7 @@ def _is_invalid_argument_message(message: str) -> bool:
         "failed to parse input JSON:",
         "failed to read input JSON:",
         "unsupported read mode:",
+        "list-threads ",
     )
     snippets = (
         "contains unsupported fields:",
@@ -1211,6 +1407,10 @@ def build_parser() -> argparse.ArgumentParser:
     list_threads.add_argument("--store-root", required=True)
     list_threads.add_argument("--thread-kind")
     list_threads.add_argument("--status")
+    list_threads.add_argument("--limit")
+    list_threads.add_argument("--cursor")
+    list_threads.add_argument("--last-event-at-or-after")
+    list_threads.add_argument("--last-event-at-or-before")
     add_read_mode_argument(list_threads)
     list_threads.set_defaults(func=cmd_list_threads)
 

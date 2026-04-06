@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any, BinaryIO, Iterator
 
 from models import RawEventRecord, ThreadMeta, ThreadRecord
-from time_utils import timestamp_sort_key
+from time_utils import parse_optional_timestamp, timestamp_sort_key
 
 
 logger = logging.getLogger(__name__)
@@ -76,6 +76,14 @@ def encode_project_turn_txn_storage_key(turn_id: str) -> str:
 
 def is_thread_storage_path(path: Path) -> bool:
     return re.fullmatch(rf"{re.escape(THREAD_STORAGE_PREFIX)}[0-9a-f]+", path.stem) is not None
+
+
+def thread_listing_sort_key(record: ThreadRecord) -> tuple[tuple[bool, float], tuple[bool, float], str]:
+    return (
+        timestamp_sort_key(record.last_event_at),
+        timestamp_sort_key(record.updated_at),
+        record.thread_id,
+    )
 
 
 def normalize_jsonl_read_mode(read_mode: str) -> str:
@@ -534,7 +542,14 @@ class ThreadStore:
             raise ValueError(f"thread snapshot temp mismatch: {temp_path.name} stores {record.thread_id}")
         return path
 
-    def list_threads(self, thread_kind: str | None = None, status: str | None = None) -> list[ThreadRecord]:
+    def list_threads(
+        self,
+        thread_kind: str | None = None,
+        status: str | None = None,
+        *,
+        last_event_at_or_after: datetime | None = None,
+        last_event_at_or_before: datetime | None = None,
+    ) -> list[ThreadRecord]:
         records: list[ThreadRecord] = []
         paths = sorted(path for path in self.threads_dir.glob("*.json") if is_thread_storage_path(path))
         for path in paths:
@@ -552,10 +567,18 @@ class ThreadStore:
                 continue
             if status is not None and record.status != status:
                 continue
+            if last_event_at_or_after is not None or last_event_at_or_before is not None:
+                last_event_at = parse_optional_timestamp(record.last_event_at, context="list_threads filter")
+                if last_event_at is None:
+                    continue
+                if last_event_at_or_after is not None and last_event_at < last_event_at_or_after:
+                    continue
+                if last_event_at_or_before is not None and last_event_at > last_event_at_or_before:
+                    continue
             records.append(record)
         return sorted(
             records,
-            key=lambda item: (timestamp_sort_key(item.last_event_at), timestamp_sort_key(item.updated_at)),
+            key=thread_listing_sort_key,
             reverse=True,
         )
 
@@ -668,8 +691,20 @@ class TimelineStore:
     def get_thread(self, thread_id: str) -> ThreadRecord | None:
         return self.threads.get_thread(thread_id)
 
-    def list_threads(self, thread_kind: str | None = None, status: str | None = None) -> list[ThreadRecord]:
-        return self.threads.list_threads(thread_kind=thread_kind, status=status)
+    def list_threads(
+        self,
+        thread_kind: str | None = None,
+        status: str | None = None,
+        *,
+        last_event_at_or_after: datetime | None = None,
+        last_event_at_or_before: datetime | None = None,
+    ) -> list[ThreadRecord]:
+        return self.threads.list_threads(
+            thread_kind=thread_kind,
+            status=status,
+            last_event_at_or_after=last_event_at_or_after,
+            last_event_at_or_before=last_event_at_or_before,
+        )
 
     def list_thread_history(self, thread_id: str) -> list[ThreadRecord]:
         return self.threads.list_thread_history(thread_id)

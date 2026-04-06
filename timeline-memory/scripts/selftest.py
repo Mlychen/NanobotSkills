@@ -150,6 +150,12 @@ def thread_snapshot_path(store_root: Path, thread_id: str) -> Path:
     return store_root / "threads" / f"{encode_thread_storage_key(thread_id)}.json"
 
 
+def write_thread_snapshot(store_root: Path, thread_id: str, payload: dict[str, object]) -> None:
+    path = thread_snapshot_path(store_root, thread_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
 def project_turn_txn_path(store_root: Path, turn_id: str) -> Path:
     return store_root / "_txn" / "project_turn" / f"turn_{turn_id.encode('utf-8').hex()}.json"
 
@@ -239,6 +245,32 @@ def assert_equal(actual: object, expected: object, message: str) -> None:
 def assert_in(needle: str, haystack: str, message: str) -> None:
     if needle not in haystack:
         raise RuntimeError(f"{message}: missing {needle!r} in {haystack!r}")
+
+
+def thread_snapshot_payload(
+    *,
+    thread_id: str,
+    title: str,
+    status: str = "planned",
+    thread_kind: str = "task",
+    last_event_at: str | None,
+    updated_at: str,
+) -> dict[str, object]:
+    return {
+        "thread_id": thread_id,
+        "thread_kind": thread_kind,
+        "title": title,
+        "status": status,
+        "plan_time": {},
+        "fact_time": {},
+        "content": {},
+        "event_refs": [],
+        "meta": {"created_by": "selftest", "updated_by": "selftest", "revision": 1},
+        "first_event_at": last_event_at,
+        "last_event_at": last_event_at,
+        "created_at": updated_at,
+        "updated_at": updated_at,
+    }
 
 
 def test_regression_basics(temp_root: Path) -> None:
@@ -544,51 +576,25 @@ def test_source_normalization_and_partial_write_recovery(temp_root: Path) -> Non
 
 def test_list_threads_orders_by_absolute_time(temp_root: Path) -> None:
     store_root = temp_root / "mixed-offset-order-store"
-    threads_dir = store_root / "threads"
-    threads_dir.mkdir(parents=True, exist_ok=True)
-    (threads_dir / f"{encode_thread_storage_key('thr_late_utc')}.json").write_text(
-        json.dumps(
-            {
-                "thread_id": "thr_late_utc",
-                "thread_kind": "task",
-                "title": "late-utc",
-                "status": "planned",
-                "plan_time": {},
-                "fact_time": {},
-                "content": {},
-                "event_refs": [],
-                "meta": {"created_by": "selftest", "updated_by": "selftest", "revision": 1},
-                "first_event_at": "2026-03-24T09:00:00+00:00",
-                "last_event_at": "2026-03-24T09:00:00+00:00",
-                "created_at": "2026-03-24T09:00:00+00:00",
-                "updated_at": "2026-03-24T09:00:00+00:00",
-            },
-            ensure_ascii=False,
-            indent=2,
+    write_thread_snapshot(
+        store_root,
+        "thr_late_utc",
+        thread_snapshot_payload(
+            thread_id="thr_late_utc",
+            title="late-utc",
+            last_event_at="2026-03-24T09:00:00+00:00",
+            updated_at="2026-03-24T09:00:00+00:00",
         ),
-        encoding="utf-8",
     )
-    (threads_dir / f"{encode_thread_storage_key('thr_early_hk')}.json").write_text(
-        json.dumps(
-            {
-                "thread_id": "thr_early_hk",
-                "thread_kind": "task",
-                "title": "early-hk",
-                "status": "planned",
-                "plan_time": {},
-                "fact_time": {},
-                "content": {},
-                "event_refs": [],
-                "meta": {"created_by": "selftest", "updated_by": "selftest", "revision": 1},
-                "first_event_at": "2026-03-24T10:00:00+08:00",
-                "last_event_at": "2026-03-24T10:00:00+08:00",
-                "created_at": "2026-03-24T10:00:00+08:00",
-                "updated_at": "2026-03-24T10:00:00+08:00",
-            },
-            ensure_ascii=False,
-            indent=2,
+    write_thread_snapshot(
+        store_root,
+        "thr_early_hk",
+        thread_snapshot_payload(
+            thread_id="thr_early_hk",
+            title="early-hk",
+            last_event_at="2026-03-24T10:00:00+08:00",
+            updated_at="2026-03-24T10:00:00+08:00",
         ),
-        encoding="utf-8",
     )
 
     threads = run_read(store_root, "list-threads")
@@ -597,6 +603,112 @@ def test_list_threads_orders_by_absolute_time(temp_root: Path) -> None:
         ["thr_late_utc", "thr_early_hk"],
         "list-threads should sort by actual instant across offsets",
     )
+
+
+def test_list_threads_pagination_and_time_window(temp_root: Path) -> None:
+    store_root = temp_root / "list-threads-query-store"
+    write_thread_snapshot(
+        store_root,
+        "thr_query_after",
+        thread_snapshot_payload(
+            thread_id="thr_query_after",
+            title="query-after",
+            last_event_at="2026-03-24T11:00:00+00:00",
+            updated_at="2026-03-24T11:00:00+00:00",
+        ),
+    )
+    write_thread_snapshot(
+        store_root,
+        "thr_query_mid",
+        thread_snapshot_payload(
+            thread_id="thr_query_mid",
+            title="query-mid",
+            last_event_at="2026-03-24T10:00:00+00:00",
+            updated_at="2026-03-24T10:00:00+00:00",
+        ),
+    )
+    write_thread_snapshot(
+        store_root,
+        "thr_query_start",
+        thread_snapshot_payload(
+            thread_id="thr_query_start",
+            title="query-start",
+            last_event_at="2026-03-24T09:00:00+00:00",
+            updated_at="2026-03-24T09:00:00+00:00",
+        ),
+    )
+    write_thread_snapshot(
+        store_root,
+        "thr_query_missing",
+        thread_snapshot_payload(
+            thread_id="thr_query_missing",
+            title="query-missing",
+            last_event_at=None,
+            updated_at="2026-03-24T12:00:00+00:00",
+        ),
+    )
+
+    default_result = run_read(store_root, "list-threads")
+    first_page = run_read(store_root, "list-threads", "--limit", "2")
+    filtered = run_read(
+        store_root,
+        "list-threads",
+        "--last-event-at-or-after",
+        "2026-03-24T09:00:00+00:00",
+        "--last-event-at-or-before",
+        "2026-03-24T10:00:00+00:00",
+        "--limit",
+        "1",
+    )
+
+    assert_equal(
+        [thread["thread_id"] for thread in default_result],
+        ["thr_query_after", "thr_query_mid", "thr_query_start", "thr_query_missing"],
+        "default list-threads should keep legacy array output",
+    )
+    assert_equal(
+        [thread["thread_id"] for thread in first_page["items"]],
+        ["thr_query_after", "thr_query_mid"],
+        "explicit paging should return the first page in descending order",
+    )
+    assert_equal(first_page["has_more"], True, "explicit paging should report remaining rows")
+    second_page = run_read(
+        store_root,
+        "list-threads",
+        "--limit",
+        "2",
+        "--cursor",
+        str(first_page["next_cursor"]),
+    )
+    assert_equal(
+        [thread["thread_id"] for thread in second_page["items"]],
+        ["thr_query_start", "thr_query_missing"],
+        "cursor paging should continue from the previous page boundary",
+    )
+    assert_equal(
+        [thread["thread_id"] for thread in filtered["items"]],
+        ["thr_query_mid"],
+        "time window paging should filter before slicing",
+    )
+    filtered_second_page = run_read(
+        store_root,
+        "list-threads",
+        "--last-event-at-or-after",
+        "2026-03-24T09:00:00+00:00",
+        "--last-event-at-or-before",
+        "2026-03-24T10:00:00+00:00",
+        "--limit",
+        "1",
+        "--cursor",
+        str(filtered["next_cursor"]),
+    )
+    assert_equal(
+        [thread["thread_id"] for thread in filtered_second_page["items"]],
+        ["thr_query_start"],
+        "time window cursor should stay within the filtered result set",
+    )
+    invalid_limit = expect_failure_json(store_root, "list-threads", "--limit", "0")
+    assert_equal(invalid_limit["error"]["code"], "TM_INVALID_ARGUMENT", "invalid limit should map to invalid argument")
 
 
 def test_context_recorded_at_is_rejected(temp_root: Path) -> None:

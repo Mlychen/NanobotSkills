@@ -133,10 +133,37 @@
 
 - `--thread-kind`
 - `--status`
+- `--last-event-at-or-after`
+- `--last-event-at-or-before`
+- `--limit`
+- `--cursor`
 
 输出：
 
-- thread 数组
+- 未显式进入分页模式时：
+  - thread 数组
+- 显式进入分页模式时：
+  - object
+    - `items`: thread 数组
+    - `next_cursor`: string 或 `null`
+    - `has_more`: boolean
+
+行为：
+
+- 默认排序按 `last_event_at`、再按 `updated_at`、最后按 `thread_id` 倒序稳定给出
+- `--last-event-at-or-after` / `--last-event-at-or-before` 基于 `last_event_at` 做闭区间过滤
+- 只要显式使用任一时间窗口参数，缺失 `last_event_at` 的 thread 就不会命中过滤结果
+- 未显式进入分页模式时，成功输出继续保持 thread 数组
+- 显式传入 `--limit` 或 `--cursor` 时进入分页模式
+- 分页模式默认页大小为 `100`，最大页大小为 `200`
+- `--cursor` 是不透明游标，必须与生成它时使用的过滤条件保持一致
+- 分页建立在当前稳定排序与过滤结果之上；继续翻页时顺序不得漂移
+
+边界：
+
+- `--limit` 必须是正整数，且不能大于 `200`
+- 非法 `--cursor` 返回 `TM_INVALID_ARGUMENT`
+- 非法时间戳或反向时间窗口返回 `TM_INVALID_ARGUMENT`
 
 ### `list-thread-history`
 

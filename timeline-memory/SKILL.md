@@ -35,6 +35,8 @@ uv run python scripts/timeline_cli.py <command> --store-root <path> [--input fil
 uv run python scripts/timeline_cli.py project-turn --store-root /path/to/store --input turn.json --read-mode compat
 uv run python scripts/timeline_cli.py get-thread --store-root /path/to/store --thread-id thr_pay_bill --read-mode strict
 uv run python scripts/timeline_cli.py list-threads --store-root /path/to/store --thread-kind task --status planned --read-mode strict
+uv run python scripts/timeline_cli.py list-threads --store-root /path/to/store --status planned --last-event-at-or-after 2026-03-24T09:00:00+00:00 --read-mode strict
+uv run python scripts/timeline_cli.py list-threads --store-root /path/to/store --limit 50 --cursor <opaque-cursor> --read-mode strict
 uv run python scripts/timeline_cli.py list-thread-history --store-root /path/to/store --thread-id thr_pay_bill --read-mode strict
 ```
 
@@ -127,6 +129,11 @@ uv run python scripts/timeline_cli.py project-turn --store-root ./timeline-store
 - 记忆类 turn：调用 `project-turn`。
 - 闲聊或非记忆类 turn：不要写 `timeline-store`。
 - 回到同一主题时，先通过 `get-thread` / `list-threads` 找到原来的 `thread_id`，再更新同一条 thread。
+- `list-threads` 默认仍返回 thread 数组；只有显式传 `--limit` 或 `--cursor` 时，才返回带 `items` / `next_cursor` / `has_more` 的分页对象。
+- `list-threads` 支持 `--last-event-at-or-after` / `--last-event-at-or-before`，按 `last_event_at` 做闭区间过滤。
+- 时间窗口过滤与分页都建立在同一稳定排序上：`last_event_at`、`updated_at`、`thread_id` 倒序。
+- 分页模式默认页大小为 `100`，最大页大小为 `200`；`--cursor` 是不透明游标，不要自行拼接或修改。
+- 只要显式使用时间窗口过滤，缺失 `last_event_at` 的 thread 就不会命中过滤结果。
 - `project-turn` 会自动生成 raw event、补齐时间戳、维护 revision/history，并返回标准化 thread 快照。
 - `project-turn` 的 `recorded_at` 始终由系统写入时生成，调用方不能指定。
 - `project-turn` 成功写入时，同一 turn 的 inbound / outbound raw event 共享 `correlation_id = turn_id`。

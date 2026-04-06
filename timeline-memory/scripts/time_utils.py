@@ -7,13 +7,14 @@ import logging
 logger = logging.getLogger(__name__)
 
 
-def parse_optional_timestamp(value: str | None, *, context: str) -> datetime | None:
+def parse_optional_timestamp(value: str | None, *, context: str, emit_warning: bool = True) -> datetime | None:
     if not value:
         return None
     try:
         parsed = datetime.fromisoformat(value)
     except ValueError:
-        logger.warning("Invalid timestamp for %s: %s", context, value)
+        if emit_warning:
+            logger.warning("Invalid timestamp for %s: %s", context, value)
         return None
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=timezone.utc)

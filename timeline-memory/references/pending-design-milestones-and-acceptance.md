@@ -701,6 +701,178 @@
 - 在数据量增长场景下查询结果稳定且顺序可预测
 - 新查询能力不破坏既有调用方式
 
+为什么现在做 M6：
+
+- M3 并发写入、M4 错误模型、M5 事件语义都已完成第一版闭环；当前短板已从“如何稳定写入”转为“如何在数据增长后稳定读取”
+- 当前 `list-threads` 公开能力仍只支持 `--thread-kind` / `--status` 两个过滤条件，见 [timeline_cli.py](file:///d:/Code/NanobotSkills/timeline-memory/scripts/timeline_cli.py#L957-L960) 与 [timeline_cli.py](file:///d:/Code/NanobotSkills/timeline-memory/scripts/timeline_cli.py#L1208-L1213)
+- 当前 `schema.md` 中 `list-threads` 的公开合同也还只有最小输入输出描述，尚未覆盖分页、时间窗口与检索边界，见 [schema.md](file:///d:/Code/NanobotSkills/timeline-memory/references/schema.md#L123-L142)
+- 当前底层排序规则已经稳定为“按 `last_event_at`、再按 `updated_at` 倒序”，且已有跨时区排序回归；这为在不改存储模型的前提下继续扩查询合同提供了基础，见 [store.py](file:///d:/Code/NanobotSkills/timeline-memory/scripts/store.py#L537-L560) 与 [test_timeline_cli_e2e.py](file:///d:/Code/NanobotSkills/timeline-memory/tests/timeline/test_timeline_cli_e2e.py#L1223-L1276)
+
+设计结论：
+
+- M6 第一版优先级明确收敛为：
+  - 先做 `list-threads` 分页
+  - 再做时间窗口过滤
+  - 文本检索放在最后一段，避免一开始把排序、匹配、性能三件事同时放大
+- 第一版查询增强只扩 `list-threads`；`get-thread` 与 `list-thread-history` 保持现有合同不变
+- 分页必须建立在稳定排序之上；新增分页参数后，默认排序语义继续保持与当前实现一致
+- 第一版优先保持兼容：
+  - 默认 `list-threads` 成功输出仍保持“thread 数组”
+  - 只有显式进入分页模式时，才返回带分页元数据的包装对象
+- 时间窗口过滤第一版只做结构化时间过滤，不引入模糊自然语言时间解析
+- 文本检索第一版若进入实现，也只做“可选包含匹配”的最小能力，不引入倒排索引、相关性排序或复杂评分
+
+非目标：
+
+- M6 不重写底层存储布局，不为查询阶段引入额外索引文件
+- M6 不在第一版中做跨 thread / 跨 turn 图查询
+- M6 不在第一版中改变默认 `list-threads` 成功输出形态；未显式进入分页模式时，仍返回 thread 数组
+- M6 不把 M5 的 `correlation_id` / `causation_id` 直接暴露成新的查询入口；这类高级语义查询留待后续里程碑再评估
+- M6 不在第一版中做全文检索、分词、ranking、高亮等搜索体验能力
+
+当前实现状态：
+
+- 已完成 M6 第一版分页与时间窗口过滤：
+  - [timeline_cli.py](file:///d:/Code/NanobotSkills/timeline-memory/scripts/timeline_cli.py) 已为 `list-threads` 增加：
+    - `--limit`
+    - `--cursor`
+    - `--last-event-at-or-after`
+    - `--last-event-at-or-before`
+  - 默认调用仍返回 thread 数组；只有显式进入分页模式时才返回 `items / next_cursor / has_more`
+  - 分页模式默认页大小固定为 `100`，最大页大小固定为 `200`
+- 已完成稳定排序与过滤收口：
+  - [store.py](file:///d:/Code/NanobotSkills/timeline-memory/scripts/store.py) 现已把 `list-threads` 排序稳定到 `last_event_at`、`updated_at`、`thread_id` 倒序
+  - 时间窗口过滤第一版基于 `last_event_at` 闭区间执行
+  - 一旦显式启用时间窗口过滤，缺失 `last_event_at` 的 thread 不进入结果集
+- 已完成回归覆盖：
+  - [test_timeline_cli_e2e.py](file:///d:/Code/NanobotSkills/timeline-memory/tests/timeline/test_timeline_cli_e2e.py) 已覆盖：
+    - 默认数组输出兼容
+    - 多页翻页顺序一致
+    - 时间窗口过滤与分页组合
+    - 非法 `limit` / `cursor` / 时间窗口错误码
+  - [selftest.py](file:///d:/Code/NanobotSkills/timeline-memory/scripts/selftest.py) 已补最小冒烟
+- 已完成公开合同同步：
+  - [schema.md](file:///d:/Code/NanobotSkills/timeline-memory/references/schema.md) 与 [SKILL.md](file:///d:/Code/NanobotSkills/timeline-memory/SKILL.md) 已同步 M6 第一版合同
+- 当前结论：
+  - M6 P1 / P2 / P3 / P5 已完成第一版闭环
+  - M6 P4 中文本检索继续后置，不纳入当前提交范围
+
+当前实现观察：
+
+- `cmd_list_threads()` 当前已负责：
+  - 参数校验
+  - 兼容模式判定
+  - 不透明 cursor 校验与分页包装输出
+  - 见 [timeline_cli.py](file:///d:/Code/NanobotSkills/timeline-memory/scripts/timeline_cli.py)
+- `store.list_threads()` 当前会：
+  - 遍历全部 thread snapshot 文件
+  - 按 `thread_kind` / `status` 过滤
+  - 可选按 `last_event_at` 做闭区间过滤
+  - 最后按 `last_event_at`、`updated_at`、`thread_id` 倒序返回
+  - 见 [store.py](file:///d:/Code/NanobotSkills/timeline-memory/scripts/store.py)
+- 当前已有稳定时间排序基础设施 [timestamp_sort_key()](file:///d:/Code/NanobotSkills/timeline-memory/scripts/time_utils.py#L20-L27)，并已有“跨 offset 绝对时间排序”回归覆盖
+- 当前未完成项已不再是分页与时间窗口，而是是否继续把文本检索纳入 M6 第一版
+
+推荐落地顺序：
+
+- 第一段：文本检索评估
+  - 只做可选最小匹配能力
+  - 明确匹配字段范围、大小写策略与与现有过滤条件的组合语义
+  - 若发现合同复杂度过高，可把文本检索拆到后续里程碑
+- 第二段：M6 收口
+  - 若文本检索继续后置，则直接以“分页 + 时间窗口 + 合同同步”收口 M6
+  - 若文本检索纳入，则补 CLI E2E、自测与公开合同
+
+下一步最高价值计划：
+
+- 目标
+  - 决定文本检索是否仍属于 M6 第一版
+  - 若不纳入，则直接把 M6 视为已完成并转入下一个里程碑
+
+- 为什么优先做这一步
+  - 分页与时间窗口已经实现并完成合同同步，当前唯一剩余变量是文本检索是否值得继续放在 M6
+  - 如果继续把文本检索塞进 M6，合同复杂度会再次上升；应先判断收益是否足以覆盖新增复杂度
+
+- 第一版实施范围
+  - 只修改 `list-threads`
+  - 先不改 `get-thread` / `list-thread-history`
+  - 先不引入搜索索引或缓存
+  - 默认成功输出继续保持 thread 数组；分页包装只在显式分页模式下返回
+
+- 参数与合同建议
+  - 新增 `--limit`
+    - 作用：限制单次返回条数
+    - 默认值：分页模式下固定为 `100`
+    - 边界：非正整数或大于 `200` 返回 `TM_INVALID_ARGUMENT`
+  - 新增 `--cursor`
+    - 作用：承接上一页位置
+    - 第一版已实现为不透明 cursor，避免把排序细节直接暴露为外部硬编码合同
+    - 边界：非法 cursor 返回 `TM_INVALID_ARGUMENT`
+    - 约束：cursor 必须与生成它时使用的过滤条件保持一致
+  - 兼容策略：
+    - 未显式进入分页模式时，仍返回当前 thread 数组
+    - 显式进入分页模式时，再返回带分页元数据的对象
+  - 分页模式成功输出建议使用对象包装：
+    - `items`
+    - `next_cursor`
+    - `has_more`
+    - 保持 `items` 内单条 thread 结构不变
+
+- 时间窗口过滤建议
+  - 第一版优先围绕当前排序主轴定义，避免出现“按 A 排序、按 B 过滤”导致的认知分裂
+  - 第一版已基于 `last_event_at` 提供：
+    - 起始边界
+    - 结束边界
+  - 语义：
+    - 闭区间过滤
+    - 未启用时间窗口时，缺失 `last_event_at` 的记录继续参与默认排序
+    - 启用时间窗口时，缺失 `last_event_at` 的记录不命中过滤结果
+
+- 代码落点
+  - CLI 参数层：
+    - [timeline_cli.py](file:///d:/Code/NanobotSkills/timeline-memory/scripts/timeline_cli.py#L1208-L1213)
+  - 查询入口：
+    - [cmd_list_threads()](file:///d:/Code/NanobotSkills/timeline-memory/scripts/timeline_cli.py#L957-L960)
+  - 底层过滤与排序：
+    - [store.list_threads()](file:///d:/Code/NanobotSkills/timeline-memory/scripts/store.py#L537-L560)
+  - 时间比较基础：
+    - [time_utils.py](file:///d:/Code/NanobotSkills/timeline-memory/scripts/time_utils.py#L1-L27)
+
+- 测试计划
+  - 分页：
+    - `limit` 生效
+    - `next_cursor` 可继续取下一页
+    - 全量翻页后结果与单次全读顺序一致
+    - 非法 `limit` / `cursor` 返回稳定错误码
+  - 时间窗口：
+    - 起始边界、结束边界、闭区间/开区间语义明确
+    - 跨时区时间值过滤结果稳定
+    - 过滤后分页仍不漂移
+  - 文本检索：
+    - 仅在进入实现时再补对应最小断言，不提前把范围写宽
+
+- 分步实现计划
+  - P1：分页合同定稿（已完成）
+    - 已明确参数名、兼容模式、分页包装、默认页大小、游标策略与错误边界
+  - P2：分页实现与回归（已完成）
+    - 已完成 `list-threads` 分页读路径
+    - 已覆盖多页顺序一致性与非法参数错误码
+  - P3：时间窗口过滤（已完成）
+    - 已增加结构化时间过滤参数与回归
+    - 已保证与分页组合后结果稳定
+  - P4：评估文本检索是否留在 M6 第一版
+    - 若语义简单且不扩大合同复杂度，则纳入
+    - 否则把文本检索下沉为后续里程碑，先收 M6 前三段
+  - P5：公开合同同步（已完成）
+    - 已更新 `schema.md` 与 `SKILL.md`
+    - 已明确分页对象、过滤参数与仍未开放的查询能力
+
+- 完成判据
+  - `list-threads` 在数据量增长后仍能稳定分页且顺序可预测
+  - 时间窗口过滤与分页组合后结果不漂移
+  - 非法分页或过滤参数返回稳定错误码
+  - 文档、实现、测试三者一致
+
 ## 里程碑 M7：测试执行耗时优化
 
 目标：
