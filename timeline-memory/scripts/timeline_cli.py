@@ -22,7 +22,12 @@ from models import (  # noqa: E402
     ThreadPlanTime,
     ThreadRecord,
 )
-from store import DEFAULT_JSONL_READ_MODE, TimelineStore, VALID_JSONL_READ_MODES  # noqa: E402
+from store import (  # noqa: E402
+    DEFAULT_JSONL_READ_MODE,
+    PROJECT_TURN_TXN_STAGE_ORDER,
+    TimelineStore,
+    VALID_JSONL_READ_MODES,
+)
 logging.basicConfig(level=logging.WARNING)
 
 TIMELINE_META_KEY = "_timeline_memory"
@@ -367,6 +372,241 @@ def replay_result(store: TimelineStore, turn_input: ProjectTurnInput) -> dict[st
     }
 
 
+def _require_txn_str(txn: dict[str, Any], field_name: str) -> str:
+    value = txn.get(field_name)
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"project-turn txn.{field_name} must be a non-empty string")
+    return value
+
+
+def _require_txn_stage(txn: dict[str, Any]) -> str:
+    stage = _require_txn_str(txn, "stage")
+    if stage not in PROJECT_TURN_TXN_STAGE_ORDER:
+        allowed = ", ".join(sorted(PROJECT_TURN_TXN_STAGE_ORDER))
+        raise ValueError(f"project-turn txn.stage must be one of: {allowed}")
+    return stage
+
+
+def _require_txn_str_list(txn: dict[str, Any], field_name: str) -> list[str]:
+    value = txn.get(field_name)
+    if not isinstance(value, list) or any(not isinstance(item, str) or not item for item in value):
+        raise ValueError(f"project-turn txn.{field_name} must be a list of non-empty strings")
+    return list(value)
+
+
+def _load_txn_thread_record(txn: dict[str, Any], field_name: str) -> ThreadRecord | None:
+    value = txn.get(field_name)
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise ValueError(f"project-turn txn.{field_name} must be a JSON object")
+    try:
+        return ThreadRecord.from_dict(value)
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError(f"failed to load project-turn txn.{field_name}") from exc
+
+
+def _thread_payload(record: ThreadRecord | None) -> dict[str, Any] | None:
+    return record.to_dict() if record is not None else None
+
+
+def _project_turn_result(
+    *,
+    recorded_event_ids: list[str],
+    thread_record: ThreadRecord | None,
+    idempotent_replay: bool,
+) -> dict[str, Any]:
+    return {
+        "ok": True,
+        "idempotent_replay": idempotent_replay,
+        "recorded_event_ids": recorded_event_ids,
+        "thread": _thread_payload(thread_record),
+    }
+
+
+def build_raw_events_batch(
+    *,
+    turn_input: ProjectTurnInput,
+    recorded_at: str,
+    fingerprint: str,
+    thread_id: str | None,
+    source: str,
+) -> list[RawEventRecord]:
+    records = [
+        build_raw_event(
+            turn_input=turn_input,
+            role="inbound",
+            recorded_at=recorded_at,
+            fingerprint=fingerprint,
+            thread_id=thread_id,
+            source=source,
+        )
+    ]
+    if turn_input.assistant_text is not None:
+        records.append(
+            build_raw_event(
+                turn_input=turn_input,
+                role="outbound",
+                recorded_at=recorded_at,
+                fingerprint=fingerprint,
+                thread_id=thread_id,
+                source=source,
+            )
+        )
+    return records
+
+
+def prepare_project_turn_txn(
+    store: TimelineStore,
+    *,
+    turn_input: ProjectTurnInput,
+    fingerprint: str,
+    thread_id: str | None,
+) -> dict[str, Any]:
+    recorded_at = now_iso()
+    baseline_thread = store.get_thread(thread_id) if thread_id is not None else None
+    txn_payload = {
+        "turn_id": turn_input.turn_id,
+        "fingerprint": fingerprint,
+        "stage": "prepared",
+        "recorded_at": recorded_at,
+        "thread_id": thread_id,
+        "required_event_ids": required_turn_event_ids(turn_input),
+        "has_thread": turn_input.thread is not None,
+        "baseline_thread": _thread_payload(baseline_thread),
+        "target_snapshot": None,
+        "history_entry": None,
+    }
+    return store.write_project_turn_txn(turn_input.turn_id, txn_payload)
+
+
+def advance_project_turn_txn(
+    store: TimelineStore,
+    turn_id: str,
+    txn: dict[str, Any],
+    *,
+    stage: str | None = None,
+    **updates: Any,
+) -> dict[str, Any]:
+    payload = dict(txn)
+    if stage is not None:
+        payload["stage"] = stage
+    payload.update(updates)
+    return store.write_project_turn_txn(turn_id, payload)
+
+
+def ensure_project_turn_txn_matches(
+    *,
+    turn_input: ProjectTurnInput,
+    txn: dict[str, Any],
+    fingerprint: str,
+    thread_id: str | None,
+) -> list[str]:
+    if txn.get("fingerprint") != fingerprint:
+        raise ValueError(f"turn_id conflict: different payload already recorded for {turn_input.turn_id}")
+    if txn.get("thread_id") != thread_id:
+        raise ValueError(f"turn_id conflict: inconsistent thread metadata for {turn_input.turn_id}")
+    if bool(txn.get("has_thread")) != (turn_input.thread is not None):
+        raise ValueError(f"turn_id conflict: inconsistent thread metadata for {turn_input.turn_id}")
+    recorded_event_ids = _require_txn_str_list(txn, "required_event_ids")
+    if recorded_event_ids != required_turn_event_ids(turn_input):
+        raise ValueError(f"turn_id conflict: inconsistent required event ids for {turn_input.turn_id}")
+    return recorded_event_ids
+
+
+def execute_project_turn_txn(
+    store: TimelineStore,
+    *,
+    turn_input: ProjectTurnInput,
+    effective_source: str,
+    fingerprint: str,
+    thread_id: str | None,
+    txn: dict[str, Any],
+) -> dict[str, Any]:
+    recorded_event_ids = ensure_project_turn_txn_matches(
+        turn_input=turn_input,
+        txn=txn,
+        fingerprint=fingerprint,
+        thread_id=thread_id,
+    )
+    stage = _require_txn_stage(txn)
+    recorded_at = _require_txn_str(txn, "recorded_at")
+
+    if stage == "committed":
+        target_thread = _load_txn_thread_record(txn, "target_snapshot")
+        if target_thread is None and thread_id is not None:
+            target_thread = store.get_thread(thread_id)
+        store.delete_project_turn_txn(turn_input.turn_id)
+        return _project_turn_result(
+            recorded_event_ids=recorded_event_ids,
+            thread_record=target_thread,
+            idempotent_replay=True,
+        )
+
+    raw_records = build_raw_events_batch(
+        turn_input=turn_input,
+        recorded_at=recorded_at,
+        fingerprint=fingerprint,
+        thread_id=thread_id,
+        source=effective_source,
+    )
+    if PROJECT_TURN_TXN_STAGE_ORDER[stage] < PROJECT_TURN_TXN_STAGE_ORDER["raw_committed"]:
+        store.append_raw_events_batch(raw_records)
+        txn = advance_project_turn_txn(store, turn_input.turn_id, txn, stage="raw_committed")
+        stage = "raw_committed"
+
+    baseline_thread = _load_txn_thread_record(txn, "baseline_thread")
+    target_thread = _load_txn_thread_record(txn, "target_snapshot")
+    history_entry = _load_txn_thread_record(txn, "history_entry")
+    if thread_id is not None and target_thread is None:
+        target_thread = store.normalize_thread_for_write(
+            build_thread_record(
+                turn_input=turn_input,
+                thread_id=thread_id,
+                recorded_at=recorded_at,
+                event_ids=recorded_event_ids,
+                current=baseline_thread,
+                source=effective_source,
+            ),
+            current=baseline_thread,
+        )
+        history_entry = baseline_thread
+        txn = advance_project_turn_txn(
+            store,
+            turn_input.turn_id,
+            txn,
+            target_snapshot=target_thread.to_dict(),
+            history_entry=_thread_payload(history_entry),
+        )
+        stage = _require_txn_stage(txn)
+
+    if thread_id is not None and PROJECT_TURN_TXN_STAGE_ORDER[stage] < PROJECT_TURN_TXN_STAGE_ORDER["snapshot_committed"]:
+        if target_thread is None:
+            raise ValueError(f"project-turn txn.target_snapshot is missing for {turn_input.turn_id}")
+        store.write_thread_snapshot(target_thread)
+        txn = advance_project_turn_txn(store, turn_input.turn_id, txn, stage="snapshot_committed")
+        stage = "snapshot_committed"
+
+    if thread_id is not None and PROJECT_TURN_TXN_STAGE_ORDER[stage] < PROJECT_TURN_TXN_STAGE_ORDER["history_committed"]:
+        if history_entry is not None:
+            store.append_thread_history(history_entry)
+        txn = advance_project_turn_txn(store, turn_input.turn_id, txn, stage="history_committed")
+        stage = "history_committed"
+
+    if PROJECT_TURN_TXN_STAGE_ORDER[stage] < PROJECT_TURN_TXN_STAGE_ORDER["committed"]:
+        txn = advance_project_turn_txn(store, turn_input.turn_id, txn, stage="committed")
+        target_thread = _load_txn_thread_record(txn, "target_snapshot") or target_thread
+
+    store.delete_project_turn_txn(turn_input.turn_id)
+    if thread_id is not None and target_thread is None:
+        target_thread = store.get_thread(thread_id)
+    return _project_turn_result(
+        recorded_event_ids=recorded_event_ids,
+        thread_record=target_thread,
+        idempotent_replay=False,
+    )
+
+
 def cmd_get_thread(args: argparse.Namespace) -> int:
     store = build_store(args)
     record = store.get_thread(args.thread_id)
@@ -391,6 +631,19 @@ def cmd_project_turn(args: argparse.Namespace) -> int:
     effective_source = resolve_effective_source(turn_input)
     fingerprint = turn_input.fingerprint()
     thread_id = resolve_thread_id(turn_input)
+
+    txn = store.get_project_turn_txn(turn_input.turn_id)
+    if txn is not None:
+        return emit_json(
+            execute_project_turn_txn(
+                store,
+                turn_input=turn_input,
+                effective_source=effective_source,
+                fingerprint=fingerprint,
+                thread_id=thread_id,
+                txn=txn,
+            )
+        )
 
     replay = replay_result(store, turn_input)
     if replay is not None:
@@ -437,50 +690,21 @@ def cmd_project_turn(args: argparse.Namespace) -> int:
         replay["thread"] = thread_payload
         return emit_json(replay)
 
-    recorded_at = now_iso()
-    inbound_event = build_raw_event(
+    txn = prepare_project_turn_txn(
+        store,
         turn_input=turn_input,
-        role="inbound",
-        recorded_at=recorded_at,
         fingerprint=fingerprint,
         thread_id=thread_id,
-        source=effective_source,
     )
-    store.append_raw_event(inbound_event)
-    recorded_ids = [inbound_event.event_id]
-
-    if turn_input.assistant_text is not None:
-        outbound_event = build_raw_event(
+    return emit_json(
+        execute_project_turn_txn(
+            store,
             turn_input=turn_input,
-            role="outbound",
-            recorded_at=recorded_at,
+            effective_source=effective_source,
             fingerprint=fingerprint,
             thread_id=thread_id,
-            source=effective_source,
+            txn=txn,
         )
-        store.append_raw_event(outbound_event)
-        recorded_ids.append(outbound_event.event_id)
-
-    thread_payload = None
-    if thread_id is not None:
-        current = store.get_thread(thread_id)
-        thread_record = build_thread_record(
-            turn_input=turn_input,
-            thread_id=thread_id,
-            recorded_at=recorded_at,
-            event_ids=recorded_ids,
-            current=current,
-            source=effective_source,
-        )
-        thread_payload = store.upsert_thread(thread_record).to_dict()
-
-    return emit_json(
-        {
-            "ok": True,
-            "idempotent_replay": False,
-            "recorded_event_ids": recorded_ids,
-            "thread": thread_payload,
-        }
     )
 
 
