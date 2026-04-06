@@ -184,7 +184,7 @@
   - `project-turn` 启动时已优先检查事务文件
   - 事务存在时按阶段继续恢复
   - 事务不存在时回退到现有 replay/repair 推断逻辑
-- 第四段：进行中
+- 第四段：已完成
   - 已覆盖 `prepared`、`raw_committed`、`snapshot_committed`、`history_committed` 四类事务中断恢复
   - 已覆盖 `prepared`、`raw_committed`、`snapshot_committed`、`history_committed` 后连续执行恢复 + 重放不重复追加 history 的关键场景
   - 已开始收敛 `timeline_cli.py` 中 txn 恢复与 legacy replay 的重复判断
@@ -192,7 +192,9 @@
   - `execute_replay_recovery()` 已改为消费显式 recovery plan，不再依赖内部松散字典约定
   - 宿主测试入口已优先复用当前解释器执行 `pytest`，仅在当前环境缺少 `pytest` 时回退到 `uv run --extra dev`
   - 已继续把 replay recovery 拆为 raw/thread 两类独立 helper，并用 `thread_action` 收口线程恢复分支
-  - 下一步可考虑继续收敛 replay 与 txn 两条恢复路径里对 thread 构造/落盘的共享编排
+  - 已开始复用 replay 与 txn 两条恢复路径中的 thread write plan 构造，统一 target snapshot / history entry 的生成逻辑
+  - 已开始复用 replay raw 补齐与 txn raw 阶段推进中的共享 raw commit helper
+  - 已补“阶段内中断 + 恢复 + 再重放”组合回归，验证最终 raw / thread / history 状态收敛一致
 
 建议代码组织：
 
@@ -213,7 +215,7 @@
 - 第二步：在 `TimelineStore` 增加 `append_raw_events_batch()`，统一批量写 raw events（已完成）
 - 第三步：在 `timeline_cli.py` 中抽事务 helper，并把 `project-turn` 改写为显式阶段机（已完成）
 - 第四步：把现有 replay/repair 改成“事务优先，旧路径兜底”（已完成）
-- 第五步：补故障注入测试与回归测试（进行中）
+- 第五步：补故障注入测试与回归测试（已完成）
 
 测试矩阵：
 

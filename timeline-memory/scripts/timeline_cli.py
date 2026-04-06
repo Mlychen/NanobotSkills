@@ -216,6 +216,12 @@ class ReplayThreadState:
 
 
 @dataclass
+class ThreadWritePlan:
+    target_thread: ThreadRecord
+    history_entry: ThreadRecord | None
+
+
+@dataclass
 class ReplayRecoveryPlan:
     recorded_at: str
     thread_id: str | None
@@ -473,6 +479,40 @@ def resolve_replay_thread_action(
     return "none"
 
 
+def build_thread_write_plan(
+    store: TimelineStore,
+    *,
+    turn_input: ProjectTurnInput,
+    thread_id: str,
+    recorded_at: str,
+    event_ids: list[str],
+    baseline_thread: ThreadRecord | None,
+    source: str,
+) -> ThreadWritePlan:
+    target_thread = store.normalize_thread_for_write(
+        build_thread_record(
+            turn_input=turn_input,
+            thread_id=thread_id,
+            recorded_at=recorded_at,
+            event_ids=event_ids,
+            current=baseline_thread,
+            source=source,
+        ),
+        current=baseline_thread,
+    )
+    return ThreadWritePlan(target_thread=target_thread, history_entry=baseline_thread)
+
+
+def apply_replay_thread_write_plan(
+    store: TimelineStore,
+    *,
+    plan: ThreadWritePlan,
+) -> ThreadRecord:
+    if plan.history_entry is not None:
+        store.append_thread_history(plan.history_entry)
+    return store.write_thread_snapshot(plan.target_thread)
+
+
 def _require_txn_str(txn: dict[str, Any], field_name: str) -> str:
     value = txn.get(field_name)
     if not isinstance(value, str) or not value:
@@ -555,6 +595,26 @@ def build_raw_events_batch(
             )
         )
     return records
+
+
+def commit_project_turn_raw_events(
+    store: TimelineStore,
+    *,
+    turn_input: ProjectTurnInput,
+    recorded_at: str,
+    fingerprint: str,
+    thread_id: str | None,
+    source: str,
+) -> list[str]:
+    raw_records = build_raw_events_batch(
+        turn_input=turn_input,
+        recorded_at=recorded_at,
+        fingerprint=fingerprint,
+        thread_id=thread_id,
+        source=source,
+    )
+    store.append_raw_events_batch(raw_records)
+    return [record.event_id for record in raw_records]
 
 
 def prepare_project_turn_txn(
@@ -644,15 +704,17 @@ def execute_project_turn_txn(
             idempotent_replay=True,
         )
 
-    raw_records = build_raw_events_batch(
-        turn_input=turn_input,
-        recorded_at=recorded_at,
-        fingerprint=fingerprint,
-        thread_id=thread_id,
-        source=effective_source,
-    )
     if PROJECT_TURN_TXN_STAGE_ORDER[stage] < PROJECT_TURN_TXN_STAGE_ORDER["raw_committed"]:
-        store.append_raw_events_batch(raw_records)
+        committed_event_ids = commit_project_turn_raw_events(
+            store,
+            turn_input=turn_input,
+            recorded_at=recorded_at,
+            fingerprint=fingerprint,
+            thread_id=thread_id,
+            source=effective_source,
+        )
+        if committed_event_ids != recorded_event_ids:
+            raise ValueError(f"turn_id conflict: inconsistent raw event ids for {turn_input.turn_id}")
         txn = advance_project_turn_txn(store, turn_input.turn_id, txn, stage="raw_committed")
         stage = "raw_committed"
 
@@ -660,18 +722,17 @@ def execute_project_turn_txn(
     target_thread = _load_txn_thread_record(txn, "target_snapshot")
     history_entry = _load_txn_thread_record(txn, "history_entry")
     if thread_id is not None and target_thread is None:
-        target_thread = store.normalize_thread_for_write(
-            build_thread_record(
-                turn_input=turn_input,
-                thread_id=thread_id,
-                recorded_at=recorded_at,
-                event_ids=recorded_event_ids,
-                current=baseline_thread,
-                source=effective_source,
-            ),
-            current=baseline_thread,
+        thread_plan = build_thread_write_plan(
+            store,
+            turn_input=turn_input,
+            thread_id=thread_id,
+            recorded_at=recorded_at,
+            event_ids=recorded_event_ids,
+            baseline_thread=baseline_thread,
+            source=effective_source,
         )
-        history_entry = baseline_thread
+        target_thread = thread_plan.target_thread
+        history_entry = thread_plan.history_entry
         txn = advance_project_turn_txn(
             store,
             turn_input.turn_id,
@@ -752,17 +813,14 @@ def recover_replay_raw_events(
     recovered_ids = list(recorded_event_ids)
     if not recovery.write_outbound:
         return recovered_ids
-    outbound_event = build_raw_event(
+    return commit_project_turn_raw_events(
+        store,
         turn_input=turn_input,
-        role="outbound",
         recorded_at=recovery.recorded_at,
         fingerprint=fingerprint,
         thread_id=recovery.thread_id,
         source=effective_source,
     )
-    store.append_raw_event(outbound_event)
-    recovered_ids.append(outbound_event.event_id)
-    return recovered_ids
 
 
 def recover_replay_thread_payload(
@@ -782,19 +840,20 @@ def recover_replay_thread_payload(
             raise ValueError("replay recovery baseline thread is required for restore_snapshot")
         return store.write_thread_snapshot(baseline_thread).to_dict()
     if recovery.thread_action == "repair_thread":
-        thread_record = build_thread_record(
+        if recovery.thread_id is None:
+            raise ValueError("replay recovery thread_id is required for repair_thread")
+        thread_plan = build_thread_write_plan(
+            store,
             turn_input=turn_input,
             thread_id=recovery.thread_id,
             recorded_at=recovery.recorded_at,
             event_ids=recorded_event_ids,
-            current=recovery.baseline_thread,
+            baseline_thread=recovery.baseline_thread,
             source=effective_source,
         )
-        return store.repair_thread(
-            thread_record,
-            baseline=recovery.baseline_thread,
-            append_history=recovery.append_history,
-        ).to_dict()
+        if not recovery.append_history:
+            thread_plan = ThreadWritePlan(target_thread=thread_plan.target_thread, history_entry=None)
+        return apply_replay_thread_write_plan(store, plan=thread_plan).to_dict()
     raise ValueError(f"unsupported replay recovery thread action: {recovery.thread_action}")
 
 
