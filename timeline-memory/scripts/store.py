@@ -11,6 +11,8 @@ from time_utils import timestamp_sort_key
 
 logger = logging.getLogger(__name__)
 THREAD_STORAGE_PREFIX = "tid_"
+DEFAULT_JSONL_READ_MODE = "compat"
+VALID_JSONL_READ_MODES = {"compat", "strict"}
 
 
 def ensure_dir(path: Path) -> Path:
@@ -27,7 +29,23 @@ def is_thread_storage_path(path: Path) -> bool:
     return re.fullmatch(rf"{re.escape(THREAD_STORAGE_PREFIX)}[0-9a-f]+", path.stem) is not None
 
 
-def iter_jsonl(path: Path):
+def normalize_jsonl_read_mode(read_mode: str) -> str:
+    normalized = read_mode.strip().lower()
+    if normalized not in VALID_JSONL_READ_MODES:
+        allowed = ", ".join(sorted(VALID_JSONL_READ_MODES))
+        raise ValueError(f"unsupported read mode: {read_mode!r}; expected one of: {allowed}")
+    return normalized
+
+
+def _raise_jsonl_read_error(path: Path, *, line_no: int, reason: str, cause: Exception | None = None) -> None:
+    message = f"failed to read JSONL: {path} line {line_no}: {reason}"
+    if cause is None:
+        raise ValueError(message)
+    raise ValueError(message) from cause
+
+
+def iter_jsonl(path: Path, *, read_mode: str = DEFAULT_JSONL_READ_MODE):
+    normalized_mode = normalize_jsonl_read_mode(read_mode)
     with open(path, encoding="utf-8") as handle:
         for line_no, line in enumerate(handle, start=1):
             line = line.strip()
@@ -36,17 +54,22 @@ def iter_jsonl(path: Path):
             try:
                 payload = json.loads(line)
             except json.JSONDecodeError as exc:
+                if normalized_mode == "strict":
+                    _raise_jsonl_read_error(path, line_no=line_no, reason=f"malformed JSON ({exc.msg})", cause=exc)
                 logger.warning("Skipping malformed JSONL line %s in %s: %s", line_no, path, exc)
                 continue
             if not isinstance(payload, dict):
+                if normalized_mode == "strict":
+                    _raise_jsonl_read_error(path, line_no=line_no, reason="expected JSON object")
                 logger.warning("Skipping non-object JSONL line %s in %s", line_no, path)
                 continue
             yield payload
 
 class RawEventStore:
-    def __init__(self, store_root: Path):
+    def __init__(self, store_root: Path, *, read_mode: str = DEFAULT_JSONL_READ_MODE):
         self.store_root = ensure_dir(store_root)
         self.path = self.store_root / "raw_events.jsonl"
+        self.read_mode = normalize_jsonl_read_mode(read_mode)
 
     def append_raw_event(self, record: RawEventRecord) -> None:
         if self.get_raw_event(record.event_id) is not None:
@@ -58,7 +81,7 @@ class RawEventStore:
     def get_raw_event(self, event_id: str) -> RawEventRecord | None:
         if not self.path.exists():
             return None
-        for payload in iter_jsonl(self.path):
+        for payload in iter_jsonl(self.path, read_mode=self.read_mode):
             if payload.get("event_id") != event_id:
                 continue
             try:
@@ -69,8 +92,9 @@ class RawEventStore:
 
 
 class ThreadHistoryStore:
-    def __init__(self, store_root: Path):
+    def __init__(self, store_root: Path, *, read_mode: str = DEFAULT_JSONL_READ_MODE):
         self.history_dir = ensure_dir(store_root / "thread_history")
+        self.read_mode = normalize_jsonl_read_mode(read_mode)
 
     def append(self, record: ThreadRecord) -> None:
         path = self.path_for(record.thread_id)
@@ -88,7 +112,7 @@ class ThreadHistoryStore:
 
     def _load_history(self, path: Path, *, thread_id: str) -> list[ThreadRecord]:
         records: list[ThreadRecord] = []
-        for payload in iter_jsonl(path):
+        for payload in iter_jsonl(path, read_mode=self.read_mode):
             try:
                 records.append(ThreadRecord.from_dict(payload))
             except (KeyError, TypeError, ValueError) as exc:
@@ -102,10 +126,11 @@ class ThreadHistoryStore:
 
 
 class ThreadStore:
-    def __init__(self, store_root: Path):
+    def __init__(self, store_root: Path, *, read_mode: str = DEFAULT_JSONL_READ_MODE):
         self.store_root = ensure_dir(store_root)
         self.threads_dir = ensure_dir(self.store_root / "threads")
-        self.history_store = ThreadHistoryStore(self.store_root)
+        self.read_mode = normalize_jsonl_read_mode(read_mode)
+        self.history_store = ThreadHistoryStore(self.store_root, read_mode=self.read_mode)
 
     def get_thread(self, thread_id: str) -> ThreadRecord | None:
         path = self.path_for(thread_id)
@@ -128,14 +153,23 @@ class ThreadStore:
 
     def upsert_thread(self, record: ThreadRecord) -> ThreadRecord:
         current = self.get_thread(record.thread_id)
-        normalized = self.normalize_for_write(record, current=current)
-        if current is not None:
-            self.history_store.append(current)
-        self.path_for(normalized.thread_id).write_text(
-            json.dumps(normalized.to_dict(), indent=2, ensure_ascii=False),
+        return self.write_thread(record, current=current, append_history=current is not None)
+
+    def repair_thread(
+        self,
+        record: ThreadRecord,
+        *,
+        baseline: ThreadRecord | None,
+        append_history: bool,
+    ) -> ThreadRecord:
+        return self.write_thread(record, current=baseline, append_history=append_history)
+
+    def write_snapshot(self, record: ThreadRecord) -> ThreadRecord:
+        self.path_for(record.thread_id).write_text(
+            json.dumps(record.to_dict(), indent=2, ensure_ascii=False),
             encoding="utf-8",
         )
-        return normalized
+        return record
 
     def list_threads(self, thread_kind: str | None = None, status: str | None = None) -> list[ThreadRecord]:
         records: list[ThreadRecord] = []
@@ -201,11 +235,32 @@ class ThreadStore:
     def path_for(self, thread_id: str) -> Path:
         return self.threads_dir / f"{encode_thread_storage_key(thread_id)}.json"
 
+    def latest_history(self, thread_id: str) -> ThreadRecord | None:
+        history = self.history_store.list_thread_history(thread_id)
+        return history[-1] if history else None
+
+    def write_thread(
+        self,
+        record: ThreadRecord,
+        *,
+        current: ThreadRecord | None,
+        append_history: bool,
+    ) -> ThreadRecord:
+        normalized = self.normalize_for_write(record, current=current)
+        if append_history and current is not None:
+            self.history_store.append(current)
+        self.path_for(normalized.thread_id).write_text(
+            json.dumps(normalized.to_dict(), indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        return normalized
+
 
 class TimelineStore:
-    def __init__(self, store_root: Path):
-        self.raw_events = RawEventStore(store_root)
-        self.threads = ThreadStore(store_root)
+    def __init__(self, store_root: Path, *, read_mode: str = DEFAULT_JSONL_READ_MODE):
+        normalized_mode = normalize_jsonl_read_mode(read_mode)
+        self.raw_events = RawEventStore(store_root, read_mode=normalized_mode)
+        self.threads = ThreadStore(store_root, read_mode=normalized_mode)
 
     def append_raw_event(self, record: RawEventRecord) -> None:
         self.raw_events.append_raw_event(record)
@@ -216,6 +271,18 @@ class TimelineStore:
     def upsert_thread(self, record: ThreadRecord) -> ThreadRecord:
         return self.threads.upsert_thread(record)
 
+    def repair_thread(
+        self,
+        record: ThreadRecord,
+        *,
+        baseline: ThreadRecord | None,
+        append_history: bool,
+    ) -> ThreadRecord:
+        return self.threads.repair_thread(record, baseline=baseline, append_history=append_history)
+
+    def write_thread_snapshot(self, record: ThreadRecord) -> ThreadRecord:
+        return self.threads.write_snapshot(record)
+
     def get_thread(self, thread_id: str) -> ThreadRecord | None:
         return self.threads.get_thread(thread_id)
 
@@ -224,3 +291,6 @@ class TimelineStore:
 
     def list_thread_history(self, thread_id: str) -> list[ThreadRecord]:
         return self.threads.list_thread_history(thread_id)
+
+    def latest_thread_history(self, thread_id: str) -> ThreadRecord | None:
+        return self.threads.latest_history(thread_id)

@@ -19,6 +19,14 @@ def _thread_snapshot_path(store_root: Path, thread_id: str) -> Path:
     return store_root / "threads" / f"tid_{thread_id.encode('utf-8').hex()}.json"
 
 
+def _event_ref_ids(thread_payload: dict) -> list[str]:
+    return [ref["event_id"] for ref in thread_payload["event_refs"]]
+
+
+def _thread_history_path(store_root: Path, thread_id: str) -> Path:
+    return store_root / "thread_history" / f"tid_{thread_id.encode('utf-8').hex()}.jsonl"
+
+
 def test_project_turn_idempotent_replay_and_query_surface(cli_runner, scratch_root: Path) -> None:
     store_root = scratch_root / "timeline-store"
     payload = {
@@ -192,6 +200,28 @@ def test_source_normalization_and_partial_write_recovery(cli_runner, scratch_roo
     assert len(_raw_event_lines(inbound_only_store)) == 2
     assert repaired_thread["title"] == "repair"
 
+    no_thread_payload = {
+        "turn_id": "agent:e2e:repair:0001-no-thread",
+        "user_text": "只有 raw event，需要补齐 outbound。",
+        "assistant_text": "已补齐 outbound。",
+    }
+    no_thread_template_store = scratch_root / "repair-no-thread-template"
+    cli_runner.run_json(no_thread_template_store, "project-turn", payload=no_thread_payload)
+    no_thread_inbound_line = _raw_event_lines(no_thread_template_store)[0]
+
+    no_thread_store = scratch_root / "repair-no-thread"
+    no_thread_store.mkdir(parents=True, exist_ok=True)
+    (no_thread_store / "raw_events.jsonl").write_text(f"{no_thread_inbound_line}\n", encoding="utf-8")
+    no_thread_replay = cli_runner.run_json(no_thread_store, "project-turn", payload=no_thread_payload)
+
+    assert no_thread_replay["idempotent_replay"] is False
+    assert no_thread_replay["recorded_event_ids"] == [
+        "agent:e2e:repair:0001-no-thread:in",
+        "agent:e2e:repair:0001-no-thread:out",
+    ]
+    assert no_thread_replay["thread"] is None
+    assert len(_raw_event_lines(no_thread_store)) == 2
+
     missing_snapshot_store = scratch_root / "repair-missing-thread"
     missing_payload = {
         "turn_id": "agent:e2e:repair:0002",
@@ -207,6 +237,90 @@ def test_source_normalization_and_partial_write_recovery(cli_runner, scratch_roo
     assert missing_snapshot_replay["idempotent_replay"] is False
     assert missing_snapshot_replay["thread"]["title"] == "repair-thread"
     assert len(_raw_event_lines(missing_snapshot_store)) == 2
+
+
+def test_existing_thread_inbound_only_replay_recovers_next_revision(cli_runner, scratch_root: Path) -> None:
+    store_root = scratch_root / "repair-existing-thread"
+    first_payload = {
+        "turn_id": "agent:e2e:repair-existing:0001",
+        "user_text": "第一次记录线程。",
+        "assistant_text": "已记录第一次。",
+        "thread": {"thread_id": "thr_existing_repair", "title": "first", "status": "planned"},
+    }
+    second_payload = {
+        "turn_id": "agent:e2e:repair-existing:0002",
+        "user_text": "第二次更新线程。",
+        "assistant_text": "已记录第二次。",
+        "thread": {"thread_id": "thr_existing_repair", "title": "second", "status": "planned"},
+    }
+
+    cli_runner.run_json(store_root, "project-turn", payload=first_payload)
+    template_store = scratch_root / "repair-existing-template"
+    cli_runner.run_json(template_store, "project-turn", payload=second_payload)
+    inbound_line = _raw_event_lines(template_store)[0]
+    with open(store_root / "raw_events.jsonl", "a", encoding="utf-8") as handle:
+        handle.write(f"{inbound_line}\n")
+
+    replay = cli_runner.run_json(store_root, "project-turn", payload=second_payload)
+    thread = cli_runner.run_json(store_root, "get-thread", args=["--thread-id", "thr_existing_repair"])
+    history = cli_runner.run_json(store_root, "list-thread-history", args=["--thread-id", "thr_existing_repair"])
+
+    assert replay["idempotent_replay"] is False
+    assert replay["recorded_event_ids"] == [
+        "agent:e2e:repair-existing:0002:in",
+        "agent:e2e:repair-existing:0002:out",
+    ]
+    assert thread["meta"]["revision"] == 2
+    assert thread["title"] == "second"
+    assert _event_ref_ids(thread) == [
+        "agent:e2e:repair-existing:0001:in",
+        "agent:e2e:repair-existing:0001:out",
+        "agent:e2e:repair-existing:0002:in",
+        "agent:e2e:repair-existing:0002:out",
+    ]
+    assert len(history) == 1
+    assert history[0]["meta"]["revision"] == 1
+    assert _event_ref_ids(history[0]) == [
+        "agent:e2e:repair-existing:0001:in",
+        "agent:e2e:repair-existing:0001:out",
+    ]
+    assert len(_raw_event_lines(store_root)) == 4
+
+
+def test_missing_snapshot_replay_preserves_multiturn_thread_state(cli_runner, scratch_root: Path) -> None:
+    store_root = scratch_root / "repair-multiturn-snapshot"
+    first_payload = {
+        "turn_id": "agent:e2e:repair-snapshot:0001",
+        "user_text": "第一次记录线程。",
+        "assistant_text": "已记录第一次。",
+        "thread": {"thread_id": "thr_snapshot_repair", "title": "first", "status": "planned"},
+    }
+    second_payload = {
+        "turn_id": "agent:e2e:repair-snapshot:0002",
+        "user_text": "第二次更新线程。",
+        "assistant_text": "已记录第二次。",
+        "thread": {"thread_id": "thr_snapshot_repair", "title": "second", "status": "planned"},
+    }
+
+    cli_runner.run_json(store_root, "project-turn", payload=first_payload)
+    cli_runner.run_json(store_root, "project-turn", payload=second_payload)
+    thread_before = cli_runner.run_json(store_root, "get-thread", args=["--thread-id", "thr_snapshot_repair"])
+    history_before = cli_runner.run_json(store_root, "list-thread-history", args=["--thread-id", "thr_snapshot_repair"])
+
+    for path in (store_root / "threads").glob("*.json"):
+        path.unlink()
+
+    replay = cli_runner.run_json(store_root, "project-turn", payload=second_payload)
+    thread_after = cli_runner.run_json(store_root, "get-thread", args=["--thread-id", "thr_snapshot_repair"])
+    history_after = cli_runner.run_json(store_root, "list-thread-history", args=["--thread-id", "thr_snapshot_repair"])
+
+    assert replay["idempotent_replay"] is False
+    assert thread_after["meta"]["revision"] == thread_before["meta"]["revision"]
+    assert thread_after["created_at"] == thread_before["created_at"]
+    assert thread_after["first_event_at"] == thread_before["first_event_at"]
+    assert _event_ref_ids(thread_after) == _event_ref_ids(thread_before)
+    assert history_after == history_before
+    assert len(_raw_event_lines(store_root)) == 4
 
 
 def test_list_threads_orders_by_absolute_time_across_offsets(cli_runner, scratch_root: Path) -> None:
@@ -301,3 +415,183 @@ def test_turn_id_conflict_returns_error(cli_runner, scratch_root: Path) -> None:
     )
 
     assert "different payload already recorded" in error
+
+
+def test_replay_rejects_outbound_only_partial_write(cli_runner, scratch_root: Path) -> None:
+    payload = {
+        "turn_id": "agent:e2e:missing-inbound:0001",
+        "user_text": "先写入完整，再手工删 inbound。",
+        "assistant_text": "这是回复。",
+        "thread": {"thread_id": "thr_missing_inbound", "title": "missing-inbound", "status": "planned"},
+    }
+    template_store = scratch_root / "missing-inbound-template"
+    cli_runner.run_json(template_store, "project-turn", payload=payload)
+    outbound_line = _raw_event_lines(template_store)[1]
+
+    broken_store = scratch_root / "missing-inbound-store"
+    broken_store.mkdir(parents=True, exist_ok=True)
+    (broken_store / "raw_events.jsonl").write_text(f"{outbound_line}\n", encoding="utf-8")
+
+    error = cli_runner.expect_failure(broken_store, "project-turn", payload=payload)
+
+    assert "partial write detected" in error
+    assert "missing inbound" in error
+
+
+def test_replay_rejects_raw_event_without_timeline_metadata(cli_runner, scratch_root: Path) -> None:
+    store_root = scratch_root / "missing-meta-store"
+    store_root.mkdir(parents=True, exist_ok=True)
+    inbound = {
+        "event_id": "agent:e2e:missing-meta:0001:in",
+        "event_type": "user_message",
+        "recorded_at": "2026-03-24T10:00:00+08:00",
+        "source": "skill://timeline-memory",
+        "actor_kind": "user",
+        "actor_id": "user",
+        "raw_text": "缺少 timeline 元数据",
+        "payload": {"message": "缺少 timeline 元数据"},
+        "schema_version": 1,
+    }
+    (store_root / "raw_events.jsonl").write_text(json.dumps(inbound, ensure_ascii=False) + "\n", encoding="utf-8")
+
+    error = cli_runner.expect_failure(
+        store_root,
+        "project-turn",
+        payload={
+            "turn_id": "agent:e2e:missing-meta:0001",
+            "user_text": "缺少 timeline 元数据",
+        },
+    )
+
+    assert "missing _timeline_memory metadata" in error
+
+
+def test_project_turn_default_read_mode_remains_compat_with_malformed_jsonl(cli_runner, scratch_root: Path) -> None:
+    store_root = scratch_root / "compat-read-mode-store"
+    payload = {
+        "turn_id": "agent:e2e:compat-read-mode:0001",
+        "user_text": "默认读取模式应保持兼容。",
+        "assistant_text": "已按兼容模式继续写入。",
+        "thread": {"thread_id": "thr_compat_default", "title": "compat-default", "status": "planned"},
+    }
+    store_root.mkdir(parents=True, exist_ok=True)
+    (store_root / "raw_events.jsonl").write_text("{bad json}\n", encoding="utf-8")
+
+    result = cli_runner.run_json(store_root, "project-turn", payload=payload)
+
+    assert result["ok"] is True
+    assert result["idempotent_replay"] is False
+    assert result["recorded_event_ids"] == [
+        "agent:e2e:compat-read-mode:0001:in",
+        "agent:e2e:compat-read-mode:0001:out",
+    ]
+    assert len(_raw_event_lines(store_root)) == 3
+    assert _raw_event_lines(store_root)[0] == "{bad json}"
+
+
+def test_project_turn_strict_read_mode_fails_on_malformed_jsonl(cli_runner, scratch_root: Path) -> None:
+    store_root = scratch_root / "strict-read-mode-store"
+    payload = {
+        "turn_id": "agent:e2e:strict-read-mode:0001",
+        "user_text": "严格模式应在坏行时失败。",
+        "assistant_text": "不应继续写入。",
+        "thread": {"thread_id": "thr_strict_fail", "title": "strict-fail", "status": "planned"},
+    }
+    store_root.mkdir(parents=True, exist_ok=True)
+    raw_path = store_root / "raw_events.jsonl"
+    raw_path.write_text("{bad json}\n", encoding="utf-8")
+
+    error = cli_runner.expect_failure(
+        store_root,
+        "project-turn",
+        payload=payload,
+        args=["--read-mode", "strict"],
+    )
+
+    assert "failed to read JSONL" in error
+    assert str(raw_path) in error
+    assert "line 1" in error
+    assert "malformed JSON" in error
+    assert _raw_event_lines(store_root) == ["{bad json}"]
+
+
+def test_list_thread_history_strict_read_mode_fails_on_non_object_jsonl(cli_runner, scratch_root: Path) -> None:
+    store_root = scratch_root / "strict-history-read-mode-store"
+    cli_runner.run_json(
+        store_root,
+        "project-turn",
+        payload={
+            "turn_id": "agent:e2e:strict-history-read-mode:0001",
+            "user_text": "先创建线程历史。",
+            "thread": {"thread_id": "thr_strict_history", "title": "strict-history", "status": "planned"},
+        },
+    )
+    cli_runner.run_json(
+        store_root,
+        "project-turn",
+        payload={
+            "turn_id": "agent:e2e:strict-history-read-mode:0002",
+            "user_text": "再更新一次，生成 history。",
+            "thread": {"thread_id": "thr_strict_history", "title": "strict-history-2", "status": "done"},
+        },
+    )
+    history_path = _thread_history_path(store_root, "thr_strict_history")
+    history_path.write_text("[]\n" + history_path.read_text(encoding="utf-8"), encoding="utf-8")
+
+    compat_history = cli_runner.run_json(
+        store_root,
+        "list-thread-history",
+        args=["--thread-id", "thr_strict_history", "--read-mode", "compat"],
+    )
+    error = cli_runner.expect_failure(
+        store_root,
+        "list-thread-history",
+        args=["--thread-id", "thr_strict_history", "--read-mode", "strict"],
+    )
+
+    assert len(compat_history) == 1
+    assert compat_history[0]["title"] == "strict-history"
+    assert "failed to read JSONL" in error
+    assert str(history_path) in error
+    assert "line 1" in error
+    assert "expected JSON object" in error
+
+
+def test_replay_rejects_inconsistent_thread_metadata(cli_runner, scratch_root: Path) -> None:
+    store_root = scratch_root / "inconsistent-thread-meta-store"
+    payload = {
+        "turn_id": "agent:e2e:thread-meta-mismatch:0001",
+        "user_text": "创建线程",
+        "assistant_text": "已创建",
+        "thread": {"thread_id": "thr_expected", "title": "expected", "status": "planned"},
+    }
+    cli_runner.run_json(store_root, "project-turn", payload=payload)
+
+    raw_path = store_root / "raw_events.jsonl"
+    records = [json.loads(line) for line in raw_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    records[0]["payload"]["_timeline_memory"]["thread_id"] = "thr_other"
+    raw_path.write_text("\n".join(json.dumps(item, ensure_ascii=False) for item in records) + "\n", encoding="utf-8")
+
+    error = cli_runner.expect_failure(store_root, "project-turn", payload=payload)
+
+    assert "inconsistent thread metadata" in error
+
+
+def test_replay_rejects_partially_reflected_thread_snapshot(cli_runner, scratch_root: Path) -> None:
+    store_root = scratch_root / "partial-thread-snapshot-store"
+    payload = {
+        "turn_id": "agent:e2e:partial-thread-snapshot:0001",
+        "user_text": "创建完整 turn",
+        "assistant_text": "创建完成",
+        "thread": {"thread_id": "thr_partial_snapshot", "title": "partial", "status": "planned"},
+    }
+    cli_runner.run_json(store_root, "project-turn", payload=payload)
+
+    snapshot_path = _thread_snapshot_path(store_root, "thr_partial_snapshot")
+    snapshot = json.loads(snapshot_path.read_text(encoding="utf-8"))
+    snapshot["event_refs"] = [snapshot["event_refs"][0]]
+    snapshot_path.write_text(json.dumps(snapshot, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    error = cli_runner.expect_failure(store_root, "project-turn", payload=payload)
+
+    assert "thread snapshot partially reflects current turn" in error

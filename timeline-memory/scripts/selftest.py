@@ -120,6 +120,21 @@ def raw_event_lines(store_root: Path) -> list[str]:
     return [line for line in raw_path.read_text(encoding="utf-8").splitlines() if line.strip()]
 
 
+def thread_history_path(store_root: Path, thread_id: str) -> Path:
+    return store_root / "thread_history" / f"{encode_thread_storage_key(thread_id)}.jsonl"
+
+
+def event_ref_ids(thread_payload: dict[str, object]) -> list[str]:
+    refs = thread_payload.get("event_refs", [])
+    if not isinstance(refs, list):
+        raise RuntimeError("thread payload event_refs must be a list")
+    return [
+        str(ref["event_id"])
+        for ref in refs
+        if isinstance(ref, dict) and ref.get("event_id") is not None
+    ]
+
+
 def assert_equal(actual: object, expected: object, message: str) -> None:
     if actual != expected:
         raise RuntimeError(f"{message}: expected {expected!r}, got {actual!r}")
@@ -349,6 +364,25 @@ def test_source_normalization_and_partial_write_recovery(temp_root: Path) -> Non
     assert_equal(len(raw_event_lines(inbound_only_store)), 2, "inbound-only repair should leave exactly two raw events")
     assert_equal(inbound_recovery["thread"]["meta"]["revision"], 1, "repaired thread should start at revision 1")
 
+    no_thread_store = temp_root / "repair-no-thread-store"
+    no_thread_payload = {
+        "turn_id": "agent:repair:no-thread:0001",
+        "user_text": "只有 inbound raw event。",
+        "assistant_text": "补齐 outbound。",
+    }
+    no_thread_template_store = temp_root / "repair-no-thread-template-store"
+    run_cli(no_thread_template_store, no_thread_payload, "project-turn")
+    append_raw_event(no_thread_store, json.loads(raw_event_lines(no_thread_template_store)[0]))
+    no_thread_recovery = run_cli(no_thread_store, no_thread_payload, "project-turn")
+    assert_equal(no_thread_recovery["idempotent_replay"], False, "no-thread repair should not report idempotent replay")
+    assert_equal(
+        no_thread_recovery["recorded_event_ids"],
+        ["agent:repair:no-thread:0001:in", "agent:repair:no-thread:0001:out"],
+        "no-thread repair should append outbound event",
+    )
+    assert_equal(no_thread_recovery["thread"], None, "no-thread repair should keep thread payload empty")
+    assert_equal(len(raw_event_lines(no_thread_store)), 2, "no-thread repair should leave exactly two raw events")
+
     missing_thread_store = temp_root / "repair-thread-store"
     missing_thread_payload = {
         "turn_id": "agent:repair:0002",
@@ -459,6 +493,188 @@ def test_context_recorded_at_is_rejected(temp_root: Path) -> None:
     assert_in("context contains unsupported fields: recorded_at", error, "context.recorded_at should be rejected")
 
 
+def test_jsonl_read_modes(temp_root: Path) -> None:
+    compat_store = temp_root / "compat-read-mode-store"
+    compat_payload = {
+        "turn_id": "agent:selftest:compat-read-mode:0001",
+        "user_text": "默认读取模式保持兼容。",
+        "assistant_text": "兼容模式继续写入。",
+        "thread": {"thread_id": "thr_selftest_compat", "title": "compat", "status": "planned"},
+    }
+    compat_store.mkdir(parents=True, exist_ok=True)
+    (compat_store / "raw_events.jsonl").write_text("{bad json}\n", encoding="utf-8")
+
+    compat_result = run_cli(compat_store, compat_payload, "project-turn")
+    assert_equal(compat_result["ok"], True, "compat read mode should keep write path available")
+    assert_equal(
+        compat_result["recorded_event_ids"],
+        ["agent:selftest:compat-read-mode:0001:in", "agent:selftest:compat-read-mode:0001:out"],
+        "compat read mode should still record both events",
+    )
+    assert_equal(len(raw_event_lines(compat_store)), 3, "compat read mode should preserve malformed line plus new events")
+    assert_equal(raw_event_lines(compat_store)[0], "{bad json}", "compat read mode should not rewrite malformed line")
+
+    strict_store = temp_root / "strict-read-mode-store"
+    strict_payload = {
+        "turn_id": "agent:selftest:strict-read-mode:0001",
+        "user_text": "严格模式遇坏行应失败。",
+        "assistant_text": "不应继续写入。",
+        "thread": {"thread_id": "thr_selftest_strict", "title": "strict", "status": "planned"},
+    }
+    strict_store.mkdir(parents=True, exist_ok=True)
+    raw_path = strict_store / "raw_events.jsonl"
+    raw_path.write_text("{bad json}\n", encoding="utf-8")
+
+    strict_error = expect_failure(
+        strict_store,
+        "project-turn",
+        "--read-mode",
+        "strict",
+        payload=strict_payload,
+    )
+    assert_in("failed to read JSONL", strict_error, "strict read mode should fail with stable prefix")
+    assert_in(str(raw_path), strict_error, "strict read mode should report the broken raw_events path")
+    assert_in("line 1", strict_error, "strict read mode should include the broken line number")
+    assert_in("malformed JSON", strict_error, "strict read mode should report malformed JSON")
+    assert_equal(raw_event_lines(strict_store), ["{bad json}"], "strict read mode should not append new raw events")
+
+    history_store = temp_root / "strict-history-read-mode-store"
+    thread_id = "thr_selftest_history_strict"
+    run_cli(
+        history_store,
+        {
+            "turn_id": "agent:selftest:strict-history-read-mode:0001",
+            "user_text": "先创建线程。",
+            "thread": {"thread_id": thread_id, "title": "strict-history", "status": "planned"},
+        },
+        "project-turn",
+    )
+    run_cli(
+        history_store,
+        {
+            "turn_id": "agent:selftest:strict-history-read-mode:0002",
+            "user_text": "再更新线程，生成 history。",
+            "thread": {"thread_id": thread_id, "title": "strict-history-2", "status": "done"},
+        },
+        "project-turn",
+    )
+    history_path = thread_history_path(history_store, thread_id)
+    history_path.write_text("[]\n" + history_path.read_text(encoding="utf-8"), encoding="utf-8")
+
+    compat_history = run_read(
+        history_store,
+        "list-thread-history",
+        "--thread-id",
+        thread_id,
+        "--read-mode",
+        "compat",
+    )
+    strict_history_error = expect_failure(
+        history_store,
+        "list-thread-history",
+        "--thread-id",
+        thread_id,
+        "--read-mode",
+        "strict",
+    )
+    assert_equal(len(compat_history), 1, "compat history read should skip non-object line")
+    assert_equal(compat_history[0]["title"], "strict-history", "compat history read should preserve valid history entry")
+    assert_in("failed to read JSONL", strict_history_error, "strict history read should fail with stable prefix")
+    assert_in(str(history_path), strict_history_error, "strict history read should report broken history path")
+    assert_in("line 1", strict_history_error, "strict history read should include the broken line number")
+    assert_in("expected JSON object", strict_history_error, "strict history read should report non-object line")
+
+
+def test_existing_thread_inbound_only_recovery_preserves_revision(temp_root: Path) -> None:
+    store_root = temp_root / "repair-existing-thread"
+    first_payload = {
+        "turn_id": "agent:selftest:repair-existing:0001",
+        "user_text": "第一次记录线程。",
+        "assistant_text": "已记录第一次。",
+        "thread": {"thread_id": "thr_selftest_existing", "title": "first", "status": "planned"},
+    }
+    second_payload = {
+        "turn_id": "agent:selftest:repair-existing:0002",
+        "user_text": "第二次更新线程。",
+        "assistant_text": "已记录第二次。",
+        "thread": {"thread_id": "thr_selftest_existing", "title": "second", "status": "planned"},
+    }
+
+    run_cli(store_root, first_payload, "project-turn")
+    template_store = temp_root / "repair-existing-template"
+    run_cli(template_store, second_payload, "project-turn")
+    append_raw_event(store_root, json.loads(raw_event_lines(template_store)[0]))
+
+    replay = run_cli(store_root, second_payload, "project-turn")
+    thread = run_read(store_root, "get-thread", "--thread-id", "thr_selftest_existing")
+    history = run_read(store_root, "list-thread-history", "--thread-id", "thr_selftest_existing")
+
+    assert_equal(replay["idempotent_replay"], False, "existing-thread replay should repair missing outbound")
+    assert_equal(thread["meta"]["revision"], 2, "existing-thread replay should advance revision to 2")
+    assert_equal(
+        event_ref_ids(thread),
+        [
+            "agent:selftest:repair-existing:0001:in",
+            "agent:selftest:repair-existing:0001:out",
+            "agent:selftest:repair-existing:0002:in",
+            "agent:selftest:repair-existing:0002:out",
+        ],
+        "existing-thread replay should preserve both turns in event refs",
+    )
+    assert_equal(len(history), 1, "existing-thread replay should append exactly one history entry")
+    assert_equal(history[0]["meta"]["revision"], 1, "history entry should keep prior revision")
+
+
+def test_missing_snapshot_recovery_preserves_multiturn_state(temp_root: Path) -> None:
+    store_root = temp_root / "repair-multiturn-snapshot"
+    first_payload = {
+        "turn_id": "agent:selftest:repair-snapshot:0001",
+        "user_text": "第一次记录线程。",
+        "assistant_text": "已记录第一次。",
+        "thread": {"thread_id": "thr_selftest_snapshot", "title": "first", "status": "planned"},
+    }
+    second_payload = {
+        "turn_id": "agent:selftest:repair-snapshot:0002",
+        "user_text": "第二次更新线程。",
+        "assistant_text": "已记录第二次。",
+        "thread": {"thread_id": "thr_selftest_snapshot", "title": "second", "status": "planned"},
+    }
+
+    run_cli(store_root, first_payload, "project-turn")
+    run_cli(store_root, second_payload, "project-turn")
+    thread_before = run_read(store_root, "get-thread", "--thread-id", "thr_selftest_snapshot")
+    history_before = run_read(store_root, "list-thread-history", "--thread-id", "thr_selftest_snapshot")
+    for path in (store_root / "threads").glob("*.json"):
+        path.unlink()
+
+    replay = run_cli(store_root, second_payload, "project-turn")
+    thread_after = run_read(store_root, "get-thread", "--thread-id", "thr_selftest_snapshot")
+    history_after = run_read(store_root, "list-thread-history", "--thread-id", "thr_selftest_snapshot")
+
+    assert_equal(replay["idempotent_replay"], False, "missing snapshot replay should repair current snapshot")
+    assert_equal(
+        thread_after["meta"]["revision"],
+        thread_before["meta"]["revision"],
+        "missing snapshot replay should preserve revision",
+    )
+    assert_equal(
+        thread_after["created_at"],
+        thread_before["created_at"],
+        "missing snapshot replay should preserve created_at",
+    )
+    assert_equal(
+        thread_after["first_event_at"],
+        thread_before["first_event_at"],
+        "missing snapshot replay should preserve first_event_at",
+    )
+    assert_equal(
+        event_ref_ids(thread_after),
+        event_ref_ids(thread_before),
+        "missing snapshot replay should preserve historical event refs",
+    )
+    assert_equal(history_after, history_before, "missing snapshot replay should not duplicate history entries")
+
+
 def main() -> int:
     temp_root = ROOT / "tmp" / "selftest-run"
     if temp_root.exists():
@@ -472,6 +688,9 @@ def main() -> int:
         test_source_normalization_and_partial_write_recovery(temp_root)
         test_list_threads_orders_by_absolute_time(temp_root)
         test_context_recorded_at_is_rejected(temp_root)
+        test_jsonl_read_modes(temp_root)
+        test_existing_thread_inbound_only_recovery_preserves_revision(temp_root)
+        test_missing_snapshot_recovery_preserves_multiturn_state(temp_root)
     finally:
         if temp_root.exists():
             shutil.rmtree(temp_root)

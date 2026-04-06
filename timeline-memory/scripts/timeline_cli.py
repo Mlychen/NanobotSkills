@@ -22,7 +22,7 @@ from models import (  # noqa: E402
     ThreadPlanTime,
     ThreadRecord,
 )
-from store import TimelineStore  # noqa: E402
+from store import DEFAULT_JSONL_READ_MODE, TimelineStore, VALID_JSONL_READ_MODES  # noqa: E402
 logging.basicConfig(level=logging.WARNING)
 
 TIMELINE_META_KEY = "_timeline_memory"
@@ -45,6 +45,10 @@ def emit_json(payload: Any) -> int:
     sys.stdout.write(json.dumps(payload, ensure_ascii=False, indent=2))
     sys.stdout.write("\n")
     return 0
+
+
+def build_store(args: argparse.Namespace) -> TimelineStore:
+    return TimelineStore(Path(args.store_root), read_mode=args.read_mode)
 
 
 def derive_thread_id(turn_id: str) -> str:
@@ -70,6 +74,13 @@ def resolve_replay_thread_ids(turn_input: ProjectTurnInput) -> set[str | None]:
 def build_event_id(turn_id: str, role: str) -> str:
     suffix = "in" if role == "inbound" else "out"
     return f"{turn_id}:{suffix}"
+
+
+def required_turn_event_ids(turn_input: ProjectTurnInput) -> list[str]:
+    event_ids = [build_event_id(turn_input.turn_id, "inbound")]
+    if turn_input.assistant_text is not None:
+        event_ids.append(build_event_id(turn_input.turn_id, "outbound"))
+    return event_ids
 
 
 def build_timeline_meta(
@@ -135,6 +146,7 @@ def merge_event_refs(
         )
     return merged
 
+
 def build_thread_record(
     *,
     turn_input: ProjectTurnInput,
@@ -170,6 +182,24 @@ def build_thread_record(
         created_at=current.created_at if current is not None else recorded_at,
         updated_at=recorded_at,
     )
+
+
+def thread_ref_event_ids(record: ThreadRecord | None) -> set[str]:
+    if record is None:
+        return set()
+    return {ref.event_id for ref in record.event_refs}
+
+
+def resolve_replay_baseline(
+    store: TimelineStore,
+    *,
+    thread_id: str,
+) -> tuple[ThreadRecord | None, ThreadRecord | None, bool]:
+    current_thread = store.get_thread(thread_id)
+    if current_thread is not None:
+        return current_thread, current_thread, True
+    history_thread = store.latest_thread_history(thread_id)
+    return None, history_thread, False
 
 
 def ensure_replay_metadata_matches(
@@ -241,10 +271,11 @@ def build_raw_event(
 def replay_result(store: TimelineStore, turn_input: ProjectTurnInput) -> dict[str, Any] | None:
     fingerprint = turn_input.fingerprint()
     expected_thread_ids = resolve_replay_thread_ids(turn_input)
-    inbound_id = build_event_id(turn_input.turn_id, "inbound")
-    outbound_id = build_event_id(turn_input.turn_id, "outbound")
+    required_event_ids = required_turn_event_ids(turn_input)
+    inbound_id = required_event_ids[0]
+    outbound_id = required_event_ids[1] if len(required_event_ids) > 1 else None
     inbound = store.get_raw_event(inbound_id)
-    outbound = store.get_raw_event(outbound_id)
+    outbound = store.get_raw_event(outbound_id) if outbound_id is not None else None
 
     if inbound is None and outbound is None:
         return None
@@ -262,6 +293,7 @@ def replay_result(store: TimelineStore, turn_input: ProjectTurnInput) -> dict[st
     if thread_id not in expected_thread_ids:
         raise ValueError(f"turn_id conflict: inconsistent thread metadata for {turn_input.turn_id}")
     recorded_ids = [inbound.event_id]
+    raw_complete = turn_input.assistant_text is None
     needs_repair = False
     if outbound is not None:
         outbound_thread_id = ensure_replay_metadata_matches(
@@ -273,26 +305,43 @@ def replay_result(store: TimelineStore, turn_input: ProjectTurnInput) -> dict[st
         if outbound_thread_id != thread_id:
             raise ValueError(f"turn_id conflict: inconsistent thread metadata for {turn_input.turn_id}")
         recorded_ids.append(outbound.event_id)
+        raw_complete = True
     elif turn_input.assistant_text is not None:
         needs_repair = True
 
     thread_payload = None
     current_thread = None
+    baseline_thread = None
+    append_history = False
     if turn_input.thread is not None:
         if thread_id is None:
             raise ValueError(f"turn_id conflict: partial write detected for {turn_input.turn_id} (missing thread)")
-        current_thread = store.get_thread(thread_id)
-        if current_thread is None:
-            needs_repair = True
-        else:
-            thread_payload = current_thread.to_dict()
-
-    if needs_repair:
-        if current_thread is not None and turn_input.assistant_text is not None and outbound is None:
+        current_thread, baseline_thread, append_history = resolve_replay_baseline(store, thread_id=thread_id)
+        baseline_ids = thread_ref_event_ids(baseline_thread)
+        required_ids = set(required_event_ids)
+        matched_ids = baseline_ids & required_ids
+        if matched_ids and len(matched_ids) != len(required_ids):
             raise ValueError(
                 f"turn_id conflict: partial write detected for {turn_input.turn_id} "
-                f"(thread snapshot exists without outbound)"
+                f"(thread snapshot partially reflects current turn)"
             )
+        if len(matched_ids) == len(required_ids):
+            if not raw_complete:
+                raise ValueError(
+                    f"turn_id conflict: partial write detected for {turn_input.turn_id} "
+                    f"(thread snapshot exists without complete raw events)"
+                )
+            if current_thread is not None:
+                thread_payload = current_thread.to_dict()
+            else:
+                thread_payload = baseline_thread.to_dict()
+                needs_repair = True
+        elif baseline_thread is None:
+            needs_repair = True
+        else:
+            needs_repair = True
+
+    if needs_repair:
         return {
             "ok": True,
             "idempotent_replay": False,
@@ -304,7 +353,9 @@ def replay_result(store: TimelineStore, turn_input: ProjectTurnInput) -> dict[st
                 "thread_id": thread_id,
                 "write_outbound": outbound is None and turn_input.assistant_text is not None,
                 "write_thread": turn_input.thread is not None and current_thread is None,
-                "current_thread": current_thread,
+                "baseline_thread": baseline_thread,
+                "append_history": append_history,
+                "restore_snapshot": current_thread is None and baseline_thread is not None and bool(thread_payload),
             },
         }
 
@@ -317,25 +368,25 @@ def replay_result(store: TimelineStore, turn_input: ProjectTurnInput) -> dict[st
 
 
 def cmd_get_thread(args: argparse.Namespace) -> int:
-    store = TimelineStore(Path(args.store_root))
+    store = build_store(args)
     record = store.get_thread(args.thread_id)
     return emit_json(record.to_dict() if record else None)
 
 
 def cmd_list_threads(args: argparse.Namespace) -> int:
-    store = TimelineStore(Path(args.store_root))
+    store = build_store(args)
     records = store.list_threads(thread_kind=args.thread_kind, status=args.status)
     return emit_json([record.to_dict() for record in records])
 
 
 def cmd_list_thread_history(args: argparse.Namespace) -> int:
-    store = TimelineStore(Path(args.store_root))
+    store = build_store(args)
     records = store.list_thread_history(args.thread_id)
     return emit_json([record.to_dict() for record in records])
 
 
 def cmd_project_turn(args: argparse.Namespace) -> int:
-    store = TimelineStore(Path(args.store_root))
+    store = build_store(args)
     turn_input = ProjectTurnInput.from_dict(read_input_json(args.input))
     effective_source = resolve_effective_source(turn_input)
     fingerprint = turn_input.fingerprint()
@@ -349,7 +400,7 @@ def cmd_project_turn(args: argparse.Namespace) -> int:
 
         recorded_at = recovery["recorded_at"]
         recorded_ids = list(replay["recorded_event_ids"])
-        current_thread = recovery["current_thread"]
+        baseline_thread = recovery["baseline_thread"]
         recovery_thread_id = recovery["thread_id"]
 
         if recovery["write_outbound"]:
@@ -365,16 +416,22 @@ def cmd_project_turn(args: argparse.Namespace) -> int:
             recorded_ids.append(outbound_event.event_id)
 
         thread_payload = replay["thread"]
-        if recovery["write_thread"]:
+        if recovery["restore_snapshot"]:
+            thread_payload = store.write_thread_snapshot(baseline_thread).to_dict()
+        elif recovery["write_thread"] or baseline_thread is not None:
             thread_record = build_thread_record(
                 turn_input=turn_input,
                 thread_id=recovery_thread_id,
                 recorded_at=recorded_at,
                 event_ids=recorded_ids,
-                current=None,
+                current=baseline_thread,
                 source=effective_source,
             )
-            thread_payload = store.upsert_thread(thread_record).to_dict()
+            thread_payload = store.repair_thread(
+                thread_record,
+                baseline=baseline_thread,
+                append_history=recovery["append_history"],
+            ).to_dict()
 
         replay["recorded_event_ids"] = recorded_ids
         replay["thread"] = thread_payload
@@ -431,25 +488,36 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Timeline memory CLI")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
+    def add_read_mode_argument(command_parser: argparse.ArgumentParser) -> None:
+        command_parser.add_argument(
+            "--read-mode",
+            choices=sorted(VALID_JSONL_READ_MODES),
+            default=DEFAULT_JSONL_READ_MODE,
+        )
+
     get_thread = subparsers.add_parser("get-thread")
     get_thread.add_argument("--store-root", required=True)
     get_thread.add_argument("--thread-id", required=True)
+    add_read_mode_argument(get_thread)
     get_thread.set_defaults(func=cmd_get_thread)
 
     list_threads = subparsers.add_parser("list-threads")
     list_threads.add_argument("--store-root", required=True)
     list_threads.add_argument("--thread-kind")
     list_threads.add_argument("--status")
+    add_read_mode_argument(list_threads)
     list_threads.set_defaults(func=cmd_list_threads)
 
     list_thread_history = subparsers.add_parser("list-thread-history")
     list_thread_history.add_argument("--store-root", required=True)
     list_thread_history.add_argument("--thread-id", required=True)
+    add_read_mode_argument(list_thread_history)
     list_thread_history.set_defaults(func=cmd_list_thread_history)
 
     project_turn = subparsers.add_parser("project-turn")
     project_turn.add_argument("--store-root", required=True)
     project_turn.add_argument("--input")
+    add_read_mode_argument(project_turn)
     project_turn.set_defaults(func=cmd_project_turn)
 
     return parser

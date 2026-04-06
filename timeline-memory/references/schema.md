@@ -231,4 +231,9 @@
 
 - 写操作：`--input <json-file>` 或 stdin JSON
 - 读操作：stdout 输出 JSON
+- 所有公开命令都支持可选 `--read-mode {compat,strict}`
+- 默认 `read-mode` 为 `compat`
+- `compat`：JSONL 坏行与非对象行会被跳过，保持兼容读取
+- `strict`：JSONL 任一坏行都会导致命令失败
+- `strict` 失败文案格式：`failed to read JSONL: <path> line <n>: <reason>`
 - 失败：stderr 输出错误，退出码非 0

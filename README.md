@@ -12,6 +12,8 @@ This repository stores local skills for AI coding agents (for example, Codex age
 
 - Todo.txt skill directory: `todo-txt/`
 - Main skill file: `todo-txt/SKILL.md`
+- Timeline memory skill directory: `timeline-memory/`
+- Main skill file: `timeline-memory/SKILL.md`
 
 ## How an Agent Should Use This Repo
 
@@ -22,6 +24,7 @@ This repository stores local skills for AI coding agents (for example, Codex age
 ## Current Skills
 
 - `todo-txt`: Local todo.txt task management workflow (create/query/update/archive tasks).
+- `timeline-memory`: Timeline memory workflow via `project-turn`/`get-thread`/`list-threads` CLI.
 
 ## Path Conventions
 
