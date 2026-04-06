@@ -132,13 +132,28 @@ uv run python scripts/timeline_cli.py project-turn --store-root ./timeline-store
 - 真实 CLI E2E：`tests/timeline/test_timeline_cli_e2e.py`
 - 宿主发现与注入：`tests/agent/test_timeline_memory_skill_integration.py`
 
-推荐入口命令（默认 `sandbox-safe`，优先稳定）：
+推荐按分层入口执行，不要把所有入口在日常开发里串起来重复跑：
+
+- 日常开发回归：
+  - 覆盖 store primitives + 主要 E2E + 宿主集成
+- 宿主级稳定性回归：
+  - 只跑 host / E2E 入口脚本
+- 发布前全量回归：
+  - 在日常开发回归通过后，再补 `selftest.py` 与多轮 host tests
+
+日常开发回归（推荐默认命令）：
+
+```bash
+uv run --extra dev python -m pytest -q tests/timeline/test_store_primitives.py tests/timeline/test_timeline_cli_e2e.py tests/agent/test_timeline_memory_skill_integration.py
+```
+
+宿主级稳定性回归（默认 `sandbox-safe`，优先稳定）：
 
 ```bash
 uv run python scripts/run-host-tests.py
 ```
 
-连续稳定性回归（连跑 3 轮）：
+连续稳定性回归（宿主入口连跑 3 轮）：
 
 ```bash
 uv run python scripts/run-host-tests.py --rounds 3
@@ -165,7 +180,32 @@ uv run python scripts/run-host-tests.py --mode standard
 uv run python scripts/clean-test-artifacts.py
 ```
 
-也可以直接跑 pytest（默认会根据入口脚本注入环境变量和参数，建议优先使用入口脚本）：
+独立 bundle / 发布前自检：
+
+```bash
+uv run python scripts/selftest.py
+```
+
+发布前全量回归建议顺序：
+
+```bash
+uv run --extra dev python -m pytest -q tests/timeline/test_store_primitives.py tests/timeline/test_timeline_cli_e2e.py tests/agent/test_timeline_memory_skill_integration.py
+uv run python scripts/selftest.py
+uv run python scripts/run-host-tests.py --rounds 3
+```
+
+不要在日常开发里把下面两类入口无脑串起来：
+
+- 直接 pytest 跑 `test_timeline_cli_e2e.py` / `test_timeline_memory_skill_integration.py`
+- `scripts/run-host-tests.py`
+
+原因：
+
+- 两者覆盖面有明显重叠
+- 当前 `run-host-tests.py` 默认就是 host / E2E 聚合入口
+- 日常把它们串起来会重复跑同一批 host / E2E
+
+也可以只跑 host / E2E 对应 pytest 文件：
 
 ```bash
 uv run --extra dev python -m pytest -q tests/timeline/test_timeline_cli_e2e.py tests/agent/test_timeline_memory_skill_integration.py

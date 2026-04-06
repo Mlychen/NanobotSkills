@@ -1,19 +1,38 @@
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import os
 import shutil
 import subprocess
+import sys
 import uuid
 from pathlib import Path
+from unittest import mock
 
 import pytest
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 CLI_PATH = REPO_ROOT / "scripts" / "timeline_cli.py"
+SCRIPTS_DIR = REPO_ROOT / "scripts"
 DEFAULT_TEST_MODE = "sandbox-safe"
 VALID_TEST_MODES = {"sandbox-safe", "standard"}
+
+if str(SCRIPTS_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPTS_DIR))
+
+import timeline_cli
+
+
+def _resolve_python_command() -> list[str]:
+    if sys.executable and Path(sys.executable).exists():
+        return [sys.executable]
+    uv = shutil.which("uv")
+    if uv is None:
+        raise RuntimeError("current python executable is unavailable and uv not found on PATH")
+    return [uv, "run", "python"]
 
 
 class CliRunner:
@@ -42,10 +61,7 @@ class CliRunner:
         payload: dict | None = None,
         args: list[str] | None = None,
     ) -> subprocess.CompletedProcess[str]:
-        uv = shutil.which("uv")
-        if uv is None:
-            raise RuntimeError("uv not found on PATH")
-        argv = [uv, "run", "python", str(self.cli_path), command, "--store-root", str(store_root)]
+        argv = [command, "--store-root", str(store_root)]
         if args:
             argv.extend(args)
         if payload is not None:
@@ -53,16 +69,23 @@ class CliRunner:
             input_path.parent.mkdir(parents=True, exist_ok=True)
             input_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
             argv.extend(["--input", str(input_path)])
-
-        return subprocess.run(
-            argv,
-            cwd=self.repo_root,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            env=self._env(),
-            check=False,
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with (
+            mock.patch.dict(os.environ, self._env(), clear=False),
+            contextlib.redirect_stdout(stdout),
+            contextlib.redirect_stderr(stderr),
+        ):
+            try:
+                returncode = timeline_cli.main(argv)
+            except SystemExit as exc:
+                code = exc.code
+                returncode = code if isinstance(code, int) else 1
+        return subprocess.CompletedProcess(
+            args=[*_resolve_python_command(), str(self.cli_path), *argv],
+            returncode=returncode,
+            stdout=stdout.getvalue(),
+            stderr=stderr.getvalue(),
         )
 
     def run_json(

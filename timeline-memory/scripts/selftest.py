@@ -4,6 +4,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 from models import ProjectTurnInput, RawEventRecord
@@ -23,11 +24,17 @@ def _env() -> dict[str, str]:
     return env
 
 
-def run_process(store_root: Path, *args: str, payload: dict | None = None) -> subprocess.CompletedProcess[str]:
+def _resolve_python_command() -> list[str]:
+    if sys.executable and Path(sys.executable).exists():
+        return [sys.executable]
     uv = shutil.which("uv")
     if uv is None:
-        raise RuntimeError("uv not found on PATH")
-    command = [uv, "run", "python", str(CLI), *args, "--store-root", str(store_root)]
+        raise RuntimeError("current python executable is unavailable and uv not found on PATH")
+    return [uv, "run", "python"]
+
+
+def run_process(store_root: Path, *args: str, payload: dict | None = None) -> subprocess.CompletedProcess[str]:
+    command = [*_resolve_python_command(), str(CLI), *args, "--store-root", str(store_root)]
     if payload is not None:
         input_path = store_root.parent / "input.json"
         input_path.parent.mkdir(parents=True, exist_ok=True)

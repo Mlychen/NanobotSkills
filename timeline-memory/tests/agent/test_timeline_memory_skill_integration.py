@@ -4,12 +4,22 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
 
 
 ALLOWED_COMMANDS = {"project-turn", "get-thread", "list-threads", "list-thread-history"}
+
+
+def resolve_python_command() -> list[str]:
+    if sys.executable and Path(sys.executable).exists():
+        return [sys.executable]
+    uv = shutil.which("uv")
+    if uv is None:
+        raise RuntimeError("current python executable is unavailable and uv not found on PATH")
+    return [uv, "run", "python"]
 
 
 class TimelineMemoryHostAdapter:
@@ -53,10 +63,7 @@ class TimelineMemoryHostAdapter:
         if command != "project-turn" and input_path is not None:
             raise ValueError(f"{command} does not accept input_path")
 
-        uv = shutil.which("uv")
-        if uv is None:
-            raise RuntimeError("uv not found on PATH")
-        argv = [uv, "run", "python", str(self.cli_path), command, "--store-root", str(store_root)]
+        argv = [*resolve_python_command(), str(self.cli_path), command, "--store-root", str(store_root)]
         if input_path is not None:
             argv.extend(["--input", str(input_path)])
         if args:

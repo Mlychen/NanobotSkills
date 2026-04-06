@@ -5,6 +5,9 @@ from pathlib import Path
 
 import pytest
 
+from models import ProjectTurnInput
+from timeline_cli import build_raw_event, resolve_effective_source, resolve_thread_id
+
 
 def _raw_event_lines(store_root: Path) -> list[str]:
     raw_path = store_root / "raw_events.jsonl"
@@ -21,12 +24,23 @@ def _thread_snapshot_path(store_root: Path, thread_id: str) -> Path:
     return store_root / "threads" / f"tid_{thread_id.encode('utf-8').hex()}.json"
 
 
+def _read_thread_snapshot(store_root: Path, thread_id: str) -> dict:
+    return json.loads(_thread_snapshot_path(store_root, thread_id).read_text(encoding="utf-8"))
+
+
 def _event_ref_ids(thread_payload: dict) -> list[str]:
     return [ref["event_id"] for ref in thread_payload["event_refs"]]
 
 
 def _thread_history_path(store_root: Path, thread_id: str) -> Path:
     return store_root / "thread_history" / f"tid_{thread_id.encode('utf-8').hex()}.jsonl"
+
+
+def _read_thread_history(store_root: Path, thread_id: str) -> list[dict]:
+    path = _thread_history_path(store_root, thread_id)
+    if not path.exists():
+        return []
+    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
 
 
 def _project_turn_txn_path(store_root: Path, turn_id: str) -> Path:
@@ -75,8 +89,20 @@ def _write_thread_history(store_root: Path, thread_id: str, records: list[dict])
     )
 
 
+def _build_inbound_raw_line(payload: dict, *, recorded_at: str = "2026-03-24T00:00:00+08:00") -> str:
+    turn_input = ProjectTurnInput.from_dict(payload)
+    record = build_raw_event(
+        turn_input=turn_input,
+        role="inbound",
+        recorded_at=recorded_at,
+        fingerprint=turn_input.fingerprint(),
+        thread_id=resolve_thread_id(turn_input),
+        source=resolve_effective_source(turn_input),
+    )
+    return json.dumps(record.to_dict(), ensure_ascii=False)
+
+
 def _assert_turn_state_matches_reference(
-    cli_runner,
     *,
     expected_store: Path,
     actual_store: Path,
@@ -84,8 +110,8 @@ def _assert_turn_state_matches_reference(
     turn_id: str,
 ) -> None:
     assert _turn_raw_events(actual_store, turn_id) == _turn_raw_events(expected_store, turn_id)
-    actual_thread = cli_runner.run_json(actual_store, "get-thread", args=["--thread-id", thread_id])
-    expected_thread = cli_runner.run_json(expected_store, "get-thread", args=["--thread-id", thread_id])
+    actual_thread = _read_thread_snapshot(actual_store, thread_id)
+    expected_thread = _read_thread_snapshot(expected_store, thread_id)
     assert actual_thread["title"] == expected_thread["title"]
     assert actual_thread["status"] == expected_thread["status"]
     assert actual_thread["content"] == expected_thread["content"]
@@ -94,8 +120,8 @@ def _assert_turn_state_matches_reference(
     assert actual_thread["meta"]["revision"] == expected_thread["meta"]["revision"]
     assert _event_ref_ids(actual_thread) == _event_ref_ids(expected_thread)
 
-    actual_history = cli_runner.run_json(actual_store, "list-thread-history", args=["--thread-id", thread_id])
-    expected_history = cli_runner.run_json(expected_store, "list-thread-history", args=["--thread-id", thread_id])
+    actual_history = _read_thread_history(actual_store, thread_id)
+    expected_history = _read_thread_history(expected_store, thread_id)
     assert len(actual_history) == len(expected_history)
     for actual_entry, expected_entry in zip(actual_history, expected_history):
         assert actual_entry["title"] == expected_entry["title"]
@@ -687,7 +713,6 @@ def test_project_turn_prepared_recovery_then_replay_matches_reference_state(cli_
     assert recovery["idempotent_replay"] is False
     assert replay["idempotent_replay"] is True
     _assert_turn_state_matches_reference(
-        cli_runner,
         expected_store=template_store,
         actual_store=store_root,
         thread_id="thr_txn_prepared_reference",
@@ -723,7 +748,7 @@ def test_project_turn_stage_recovery_then_replay_matches_reference_state(
     thread_id = f"thr_txn_{suffix}_reference"
 
     cli_runner.run_json(store_root, "project-turn", payload=first_payload)
-    baseline_thread = cli_runner.run_json(store_root, "get-thread", args=["--thread-id", thread_id])
+    baseline_thread = _read_thread_snapshot(store_root, thread_id)
 
     template_store = scratch_root / f"txn-{suffix}-reference-template"
     cli_runner.run_json(template_store, "project-turn", payload=first_payload)
@@ -731,8 +756,8 @@ def test_project_turn_stage_recovery_then_replay_matches_reference_state(
     template_events = _turn_raw_events(template_store, second_payload["turn_id"])
     fingerprint = template_events[0]["payload"]["_timeline_memory"]["fingerprint"]
     recorded_at = template_events[0]["recorded_at"]
-    target_snapshot = cli_runner.run_json(template_store, "get-thread", args=["--thread-id", thread_id])
-    template_history = cli_runner.run_json(template_store, "list-thread-history", args=["--thread-id", thread_id])
+    target_snapshot = _read_thread_snapshot(template_store, thread_id)
+    template_history = _read_thread_history(template_store, thread_id)
 
     _append_raw_records(store_root, template_events)
     if stage in {"snapshot_committed", "history_committed"}:
@@ -763,7 +788,6 @@ def test_project_turn_stage_recovery_then_replay_matches_reference_state(
     assert recovery["idempotent_replay"] is False
     assert replay["idempotent_replay"] is True
     _assert_turn_state_matches_reference(
-        cli_runner,
         expected_store=template_store,
         actual_store=store_root,
         thread_id=thread_id,
@@ -866,9 +890,7 @@ def test_source_normalization_and_partial_write_recovery(cli_runner, scratch_roo
         "assistant_text": "补齐 outbound。",
         "thread": {"thread_id": "thr_repair", "title": "repair", "status": "planned"},
     }
-    template_store = scratch_root / "repair-template"
-    cli_runner.run_json(template_store, "project-turn", payload=payload)
-    inbound_line = _raw_event_lines(template_store)[0]
+    inbound_line = _build_inbound_raw_line(payload)
 
     inbound_only_store = scratch_root / "repair-inbound"
     inbound_only_store.mkdir(parents=True, exist_ok=True)
@@ -886,9 +908,7 @@ def test_source_normalization_and_partial_write_recovery(cli_runner, scratch_roo
         "user_text": "只有 raw event，需要补齐 outbound。",
         "assistant_text": "已补齐 outbound。",
     }
-    no_thread_template_store = scratch_root / "repair-no-thread-template"
-    cli_runner.run_json(no_thread_template_store, "project-turn", payload=no_thread_payload)
-    no_thread_inbound_line = _raw_event_lines(no_thread_template_store)[0]
+    no_thread_inbound_line = _build_inbound_raw_line(no_thread_payload)
 
     no_thread_store = scratch_root / "repair-no-thread"
     no_thread_store.mkdir(parents=True, exist_ok=True)
@@ -936,9 +956,7 @@ def test_existing_thread_inbound_only_replay_recovers_next_revision(cli_runner, 
     }
 
     cli_runner.run_json(store_root, "project-turn", payload=first_payload)
-    template_store = scratch_root / "repair-existing-template"
-    cli_runner.run_json(template_store, "project-turn", payload=second_payload)
-    inbound_line = _raw_event_lines(template_store)[0]
+    inbound_line = _build_inbound_raw_line(second_payload)
     with open(store_root / "raw_events.jsonl", "a", encoding="utf-8") as handle:
         handle.write(f"{inbound_line}\n")
 

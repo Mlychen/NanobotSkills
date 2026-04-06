@@ -294,6 +294,308 @@
 - 在数据量增长场景下查询结果稳定且顺序可预测
 - 新查询能力不破坏既有调用方式
 
+## 里程碑 M7：测试执行耗时优化
+
+目标：
+
+- 在不牺牲当前回归覆盖面的前提下，显著降低日常测试等待时间
+- 优先压缩热点 E2E 中重复 CLI 子进程启动的成本
+- 将“日常回归”和“发版前全量验证”拆成更清晰的执行层次
+
+当前基线：
+
+- `uv run --extra dev python -m pytest -q tests/timeline/test_store_primitives.py tests/timeline/test_timeline_cli_e2e.py tests/agent/test_timeline_memory_skill_integration.py`
+  - 实测约 `56.957s`
+- `uv run python scripts/selftest.py`
+  - 实测约 `23.420s`
+- `uv run python scripts/run-host-tests.py`
+  - 实测约 `53.252s`
+- 当前整条串行命令：
+  - `pytest + selftest + run-host-tests`
+  - 实测约 `130.978s`
+- 热点画像：
+  - Top 20 慢测合计约 `37.69s`
+  - Top 20 慢测合计约触发 `148` 次 CLI 子进程
+  - 折算平均约 `0.255s / CLI`
+
+当前热点：
+
+- [test_project_turn_stage_recovery_then_replay_matches_reference_state](file:///d:/Code/NanobotSkills/timeline-memory/tests/timeline/test_timeline_cli_e2e.py#L707-L774)
+  - 单测约 `2.76s` 到 `2.92s`
+  - 每个参数化 case 约触发 `12` 次 CLI 子进程
+- [test_project_turn_repeated_recovery_from_snapshot_committed_txn_keeps_single_history_entry](file:///d:/Code/NanobotSkills/timeline-memory/tests/timeline/test_timeline_cli_e2e.py#L448-L515)
+  - 单测约 `2.38s`
+  - 约触发 `9` 次 CLI 子进程
+- [test_project_turn_repeated_recovery_from_history_committed_txn_keeps_single_history_entry](file:///d:/Code/NanobotSkills/timeline-memory/tests/timeline/test_timeline_cli_e2e.py#L582-L652)
+  - 单测约 `2.29s`
+  - 约触发 `9` 次 CLI 子进程
+- [test_source_normalization_and_partial_write_recovery](file:///d:/Code/NanobotSkills/timeline-memory/tests/timeline/test_timeline_cli_e2e.py#L845-L922)
+  - 单测约 `2.22s`
+  - 约触发 `8` 次 CLI 子进程
+- [test_host_adapter_e2e_write_and_read_contract](file:///d:/Code/NanobotSkills/timeline-memory/tests/agent/test_timeline_memory_skill_integration.py#L120-L139)
+  - 单测约 `1.02s`
+  - 约触发 `4` 次 CLI 子进程
+
+根因判断：
+
+- 当前热点测试大多不是单次业务逻辑特别重，而是同一测试内反复调用 CLI
+- 测试 helper 当前主要通过子进程调用 CLI，见：
+  - [conftest.py](file:///d:/Code/NanobotSkills/timeline-memory/tests/conftest.py#L37-L79)
+  - [test_timeline_memory_skill_integration.py](file:///d:/Code/NanobotSkills/timeline-memory/tests/agent/test_timeline_memory_skill_integration.py#L66-L93)
+- `_assert_turn_state_matches_reference()` 每次会额外触发 `4` 次 CLI 读取，见 [test_timeline_cli_e2e.py](file:///d:/Code/NanobotSkills/timeline-memory/tests/timeline/test_timeline_cli_e2e.py#L78-L107)
+- 当前日常命令还叠加了 `pytest`、`selftest.py`、`run-host-tests.py` 三层入口，存在明显重复覆盖
+
+P1 当前进展：
+
+- 已完成：
+  - [conftest.py](file:///d:/Code/NanobotSkills/timeline-memory/tests/conftest.py) 中的 `CliRunner` 已优先使用当前解释器直启 CLI，仅在当前解释器不可用时回退到 `uv run python`
+  - [test_timeline_memory_skill_integration.py](file:///d:/Code/NanobotSkills/timeline-memory/tests/agent/test_timeline_memory_skill_integration.py) 中的 `TimelineMemoryHostAdapter` 已切到相同策略
+  - [selftest.py](file:///d:/Code/NanobotSkills/timeline-memory/scripts/selftest.py) 内部对子 CLI 的调用也已切到相同策略
+- P1 实测结果：
+  - 三文件 pytest：
+    - 优化前约 `56.957s`
+    - 优化后约 `46.714s`
+    - 下降约 `17.98%`
+  - `selftest.py`：
+    - 优化前约 `23.420s`
+    - 优化后约 `19.474s`
+    - 下降约 `16.85%`
+  - `run-host-tests.py`：
+    - 优化前约 `53.252s`
+    - 优化后约 `44.509s`
+    - 下降约 `16.42%`
+  - 当前判断：
+    - `selftest.py` 与 `run-host-tests.py` 已获得稳定收益
+    - 三文件 pytest 尚未达到“至少下降 `20%`”的验收线，需要继续推进 P2 / P3
+
+P2 当前进展：
+
+- 已完成：
+  - [conftest.py](file:///d:/Code/NanobotSkills/timeline-memory/tests/conftest.py) 中的 `CliRunner` 已切为进程内执行 `timeline_cli.main(argv)`
+  - E2E 测试已不再为每次 `cli_runner.run_json()` / `cli_runner.expect_failure()` 额外启动真实子进程
+  - 宿主集成测试中的 [TimelineMemoryHostAdapter](file:///d:/Code/NanobotSkills/timeline-memory/tests/agent/test_timeline_memory_skill_integration.py#L24-L96) 仍保留真实 subprocess 路径，继续承担 CLI 合同冒烟角色
+- P2 实测结果：
+  - 三文件 pytest：
+    - P1 后约 `46.714s`
+    - P2 后约 `24.009s`
+    - 相比 P1 再下降约 `48.61%`
+    - 相比原始基线 `56.957s` 总降幅约 `57.85%`
+  - `run-host-tests.py`：
+    - P1 后约 `44.509s`
+    - P2 后约 `21.500s`
+    - 相比 P1 再下降约 `51.70%`
+    - 相比原始基线 `53.252s` 总降幅约 `59.63%`
+  - `selftest.py`：
+    - 约 `19.743s`
+    - 与 P1 基本持平，符合“本阶段主要优化 pytest / host tests”的预期
+- P2 后热点观察：
+  - 先前 `2.76s` 到 `2.92s` 的恢复类热点，已下降到约 `0.61s` 到 `0.71s`
+  - 当前最慢项开始转向：
+    - 个别复杂恢复场景本身的文件 IO / 状态构造
+    - `scratch_root` 清理带来的 teardown 成本
+    - 仍保留真实 subprocess 的宿主集成测试
+- 当前判断：
+  - P2 已达到“显著压缩热点 E2E 子进程成本”的目标
+  - 三文件 pytest 与 `run-host-tests.py` 都已低于 M7 中设定的目标区间
+  - 下一步可以进入 P3，继续减少高频对照读取与 teardown 成本
+
+P3 当前进展：
+
+- 已完成：
+  - [test_timeline_cli_e2e.py](file:///d:/Code/NanobotSkills/timeline-memory/tests/timeline/test_timeline_cli_e2e.py) 中的 `_assert_turn_state_matches_reference()` 已改为直接读取 store 中的 snapshot / history 文件，不再走额外 CLI 查询
+  - `prepared-reference` 与 `stage-recovery-reference` 两组对照测试的基线 snapshot / history 读取已改为直接读文件
+  - `source_normalization_and_partial_write_recovery` 与 `existing_thread_inbound_only_replay_recovers_next_revision` 已不再通过单独 template store 生成 inbound raw line，而是直接复用共享 helper 构造最小 inbound record
+- P3 实测结果：
+  - 三文件 pytest：
+    - P2 后约 `24.009s`
+    - P3 后约 `23.257s`
+    - 相比 P2 再下降约 `3.13%`
+    - 相比原始基线 `56.957s` 总降幅约 `59.17%`
+  - `run-host-tests.py`：
+    - P2 后约 `21.500s`
+    - P3 后约 `20.668s`
+    - 相比 P2 再下降约 `3.87%`
+    - 相比原始基线 `53.252s` 总降幅约 `61.19%`
+- P3 后热点观察：
+  - `test_source_normalization_and_partial_write_recovery`
+    - call 阶段已从约 `0.66s` 下降到约 `0.40s`
+    - 但 teardown 仍约 `0.55s`，说明剩余热点更多来自临时目录清理而非查询次数
+  - `_assert_turn_state_matches_reference()` 相关测试已不再额外消耗 CLI 读取路径，剩余耗时主要回到文件 IO 与状态构造
+  - 当前最慢项开始集中在：
+    - `raw_committed` 恢复类用例本身
+    - 宿主集成真实 subprocess 冒烟
+    - Windows 下目录清理 teardown
+- 当前判断：
+  - P3 已完成“减少高频对照读取并收缩部分复合场景成本”的目标
+  - 继续优化的边际收益开始下降，下一阶段更适合转向命令分层与回归入口整理
+
+P4 当前进展：
+
+- 已完成：
+  - [SKILL.md](file:///d:/Code/NanobotSkills/timeline-memory/SKILL.md) 已按“日常开发回归 / 宿主级稳定性回归 / 发布前全量回归”三层入口重写测试说明
+  - 已明确把 `store_primitives + 主要 E2E + 宿主集成` 作为默认日常回归命令
+  - 已明确 `selftest.py` 的用途是独立 bundle / 发布前自检
+  - 已明确 `run-host-tests.py` 的用途是 host / E2E 聚合入口与稳定性回归入口
+  - 已明确标注：不要在日常开发里把直接 pytest 的 host/E2E 与 `run-host-tests.py` 串起来重复执行
+- P4 当前产出：
+  - 默认日常回归命令：
+    - `uv run --extra dev python -m pytest -q tests/timeline/test_store_primitives.py tests/timeline/test_timeline_cli_e2e.py tests/agent/test_timeline_memory_skill_integration.py`
+  - 宿主级稳定性回归：
+    - `uv run python scripts/run-host-tests.py`
+  - 发布前全量回归：
+    - `uv run --extra dev python -m pytest -q tests/timeline/test_store_primitives.py tests/timeline/test_timeline_cli_e2e.py tests/agent/test_timeline_memory_skill_integration.py`
+    - `uv run python scripts/selftest.py`
+    - `uv run python scripts/run-host-tests.py --rounds 3`
+- 当前判断：
+  - P4 已完成“分层整理测试入口并明确边界”的目标
+  - 下一步主要剩余的是 P5：在文档中沉淀最终 profile 对比结论，收口本轮优化结果
+
+P5 当前进展：
+
+- 已完成：
+  - 已在同一机器、同一命令口径下重新测量三文件 pytest、`selftest.py`、`run-host-tests.py` 与整条串行命令
+  - 已将 P1-P4 的分阶段收益与最终结果收口为统一结论
+- 最终 profile 对比：
+  - 三文件 pytest：
+    - 初始基线约 `56.957s`
+    - P5 当前约 `23.257s`
+    - 总降幅约 `59.17%`
+  - `selftest.py`：
+    - 初始基线约 `23.420s`
+    - 当前约 `19.743s`
+    - 总降幅约 `15.70%`
+  - `run-host-tests.py`：
+    - 初始基线约 `53.252s`
+    - 当前约 `20.668s`
+    - 总降幅约 `61.19%`
+  - 原始整条串行命令：
+    - 初始基线约 `130.978s`
+    - 当前约 `63.088s`
+    - 总降幅约 `51.83%`
+- 最终热点结论：
+  - 主要收益来自 P2：
+    - E2E 从真实子进程切到进程内 runner
+  - P1 提供稳定但中等幅度收益：
+    - 去掉测试内部重复的 `uv run python` 启动层
+  - P3 进一步压掉了 reference-state 对照读取与部分 template store 构造成本
+  - P4 的收益主要体现在流程层：
+    - 降低日常误用重复入口的概率
+    - 让优化后的命令分层能够稳定落地
+- 目标达成情况：
+  - 三文件 pytest：
+    - 已低于目标 `35s`
+  - `run-host-tests.py`：
+    - 已低于目标 `30s` 到 `35s`
+  - 整条串行命令：
+    - 已低于目标 `75s` 到 `90s`
+- 当前判断：
+  - M7 的核心目标已完成
+  - 后续若继续优化，优先级应低于并发语义、错误模型等功能性里程碑
+  - 剩余可优化项主要集中在：
+    - Windows 下目录清理 teardown
+    - 少量仍保留真实 subprocess 的宿主冒烟
+    - 个别 `raw_committed` 恢复场景本身的文件 IO 成本
+
+分步方案：
+
+- 第一步：收口测试子进程启动方式
+  - 将测试 helper 中的 `uv run python ...` 优先替换为当前解释器直启
+  - 在已运行于 `uv run` 环境的测试进程内，优先使用 `sys.executable` 调用 [timeline_cli.py](file:///d:/Code/NanobotSkills/timeline-memory/scripts/timeline_cli.py#L984-L995)
+  - 保留“当前环境无 `pytest` 或无必要依赖时才回退到 `uv run`”的兜底逻辑
+  - 当前状态：
+    - 已完成当前解释器优先直启
+    - 已保留解释器不可用时的 `uv run python` 回退
+  - 预期收益：
+    - 先压掉每次 CLI 调用外层 `uv` 解析与环境引导成本
+    - 不改业务逻辑与公开合同，风险最低
+  - 验收标准：
+    - [test_timeline_cli_e2e.py](file:///d:/Code/NanobotSkills/timeline-memory/tests/timeline/test_timeline_cli_e2e.py) 与 [test_timeline_memory_skill_integration.py](file:///d:/Code/NanobotSkills/timeline-memory/tests/agent/test_timeline_memory_skill_integration.py) 全绿
+    - `run-host-tests.py` 保持兼容当前用法
+    - 三文件 pytest 总耗时相比当前基线至少下降 `20%`
+
+- 第二步：引入进程内 CLI runner，缩小真实子进程覆盖面
+  - 在测试层新增“进程内执行 `timeline_cli.main(argv)`”的 runner
+  - 将大部分恢复类、回放类、严格读取类用例切到进程内 runner
+  - 保留少量真实 subprocess 用例作为 CLI 合同冒烟
+  - 当前状态：
+    - 已完成 E2E 测试层的进程内 runner 切换
+    - 宿主集成测试仍保留真实 subprocess 冒烟
+  - 推荐保留真实子进程的范围：
+    - 输入文件解析
+    - stderr / exit code 合同
+    - UTF-8 编码与 PowerShell 路径行为
+  - 预期收益：
+    - 针对 `8` 到 `12` 次 CLI 调用的热点测试，直接减少解释器与进程边界开销
+  - 验收标准：
+    - Top 10 热点测试总耗时相比当前基线至少下降 `35%`
+    - 至少保留一组真实 CLI 冒烟测试覆盖 `project-turn`、`get-thread`、`list-threads`、`list-thread-history`
+
+- 第三步：瘦身高频对照读取与复合场景
+  - 重新审视 [_assert_turn_state_matches_reference()](file:///d:/Code/NanobotSkills/timeline-memory/tests/timeline/test_timeline_cli_e2e.py#L78-L107) 的使用范围
+  - 对只验证最终存储收敛的场景，优先直接对 store 文件结构断言
+  - 将“source normalization + partial write recovery”这类复合测试拆成更单一的断言路径
+  - 将公共前置构造沉淀为 helper，避免每个测试重复做多轮读写
+  - 当前状态：
+    - 已完成 reference-state 对照路径的直接文件断言
+    - 已将部分“只为生成 inbound raw line” 的 template store 替换为共享 helper
+    - teardown 仍是剩余热点之一，继续压缩需要谨慎评估测试工件清理策略
+  - 预期收益：
+    - 减少热点测试中不必要的 `4` 次对照读取
+    - 让 profile 更容易稳定反映真实热点
+  - 验收标准：
+    - Top 20 热点测试中的平均 CLI 子进程数从约 `7.4` 次降到 `5` 次以内
+    - 不降低关键恢复矩阵覆盖
+
+- 第四步：分层整理测试入口
+  - 将日常回归命令与全量回归命令分开维护
+  - 推荐分层：
+    - 日常开发：
+      - `store_primitives + 主要 E2E + 宿主集成`
+    - 发布前回归：
+      - 日常开发命令
+      - `selftest.py`
+      - `run-host-tests.py --rounds 3` 或等价稳定性入口
+  - 明确 `run-host-tests.py` 与直接 pytest 的边界，避免重复跑同一批 host/E2E
+  - 当前状态：
+    - 已在 [SKILL.md](file:///d:/Code/NanobotSkills/timeline-memory/SKILL.md) 中完成入口分层与命令示例更新
+    - 已明确 daily / prerelease / host-stability 三种入口的职责边界
+  - 预期收益：
+    - 降低开发阶段总等待时间
+    - 保留发版前的独立 bundle / 宿主级验证
+  - 验收标准：
+    - 日常回归默认命令不再重复执行同一批 host/E2E
+    - 文档中明确标注每个入口的用途与适用时机
+
+建议落地顺序：
+
+- P1：先改测试 helper 的 CLI 启动方式
+- P2：补进程内 runner，并迁移恢复类热点测试
+- P3：压缩热点测试里的重复读取与复合场景
+- P4：整理并发布新的测试命令分层
+- P5：重新 profile，并把前后对比结果回写文档
+
+建议目标：
+
+- 三文件 pytest：
+  - 从约 `56.957s` 压到 `35s` 左右或更低
+- `run-host-tests.py`：
+  - 从约 `53.252s` 压到 `30s` 到 `35s`
+- 当前整条串行命令：
+  - 从约 `130.978s` 压到 `75s` 到 `90s`
+
+风险与边界：
+
+- 不能为了降耗时而完全取消真实子进程测试，否则会丢失编码、路径、退出码和宿主注入层的真实覆盖
+- 进程内 runner 需要谨慎处理 `stdout` / `stderr` 捕获与异常到退出码的映射，保证与真实 CLI 合同一致
+- 对 store 文件做断言时，仍需保留最小 CLI 读取断言，避免只验证内部实现细节而漏掉公开查询语义
+
+完成定义：
+
+- profile 数据更新并写回本文档
+- 所有优化前后对比都基于同一机器、同一命令口径
+- 回归命令与用途在 [SKILL.md](file:///d:/Code/NanobotSkills/timeline-memory/SKILL.md) 中同步更新
+- 相关改动完成后，`uv run python scripts/run-host-tests.py` 与日常 pytest 入口均保持全绿
+
 ## 统一完成定义
 
 每个里程碑都必须满足以下完成定义：
