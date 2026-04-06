@@ -124,6 +124,30 @@ def thread_history_path(store_root: Path, thread_id: str) -> Path:
     return store_root / "thread_history" / f"{encode_thread_storage_key(thread_id)}.jsonl"
 
 
+def thread_snapshot_path(store_root: Path, thread_id: str) -> Path:
+    return store_root / "threads" / f"{encode_thread_storage_key(thread_id)}.json"
+
+
+def project_turn_txn_path(store_root: Path, turn_id: str) -> Path:
+    return store_root / "_txn" / "project_turn" / f"turn_{turn_id.encode('utf-8').hex()}.json"
+
+
+def write_project_turn_txn(store_root: Path, turn_id: str, payload: dict[str, object]) -> Path:
+    path = project_turn_txn_path(store_root, turn_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    return path
+
+
+def raw_event_records_for_turn(store_root: Path, turn_id: str) -> list[dict[str, object]]:
+    records: list[dict[str, object]] = []
+    for line in raw_event_lines(store_root):
+        record = json.loads(line)
+        if str(record["event_id"]).startswith(f"{turn_id}:"):
+            records.append(record)
+    return records
+
+
 def event_ref_ids(thread_payload: dict[str, object]) -> list[str]:
     refs = thread_payload.get("event_refs", [])
     if not isinstance(refs, list):
@@ -675,6 +699,139 @@ def test_missing_snapshot_recovery_preserves_multiturn_state(temp_root: Path) ->
     assert_equal(history_after, history_before, "missing snapshot replay should not duplicate history entries")
 
 
+def test_history_committed_txn_recovery_remains_idempotent(temp_root: Path) -> None:
+    store_root = temp_root / "txn-history-repeat-store"
+    first_payload = {
+        "turn_id": "agent:selftest:txn:history-repeat:0001",
+        "user_text": "第一次记录。",
+        "assistant_text": "已记录第一次。",
+        "thread": {"thread_id": "thr_selftest_txn_history_repeat", "title": "first", "status": "planned"},
+    }
+    second_payload = {
+        "turn_id": "agent:selftest:txn:history-repeat:0002",
+        "user_text": "第二次记录。",
+        "assistant_text": "已记录第二次。",
+        "thread": {"thread_id": "thr_selftest_txn_history_repeat", "title": "second", "status": "planned"},
+    }
+
+    run_cli(store_root, first_payload, "project-turn")
+    baseline_thread = run_read(store_root, "get-thread", "--thread-id", "thr_selftest_txn_history_repeat")
+
+    template_store = temp_root / "txn-history-repeat-template"
+    run_cli(template_store, first_payload, "project-turn")
+    run_cli(template_store, second_payload, "project-turn")
+    template_records = raw_event_records_for_turn(template_store, second_payload["turn_id"])
+    fingerprint = template_records[0]["payload"][TIMELINE_META_KEY]["fingerprint"]
+    recorded_at = template_records[0]["recorded_at"]
+    target_snapshot = run_read(template_store, "get-thread", "--thread-id", "thr_selftest_txn_history_repeat")
+
+    for record in template_records:
+        append_raw_event(store_root, record)
+    thread_snapshot_path(store_root, "thr_selftest_txn_history_repeat").parent.mkdir(parents=True, exist_ok=True)
+    thread_snapshot_path(store_root, "thr_selftest_txn_history_repeat").write_text(
+        json.dumps(target_snapshot, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    history_path = thread_history_path(store_root, "thr_selftest_txn_history_repeat")
+    history_path.parent.mkdir(parents=True, exist_ok=True)
+    history_path.write_text(json.dumps(baseline_thread, ensure_ascii=False) + "\n", encoding="utf-8")
+
+    txn_path = write_project_turn_txn(
+        store_root,
+        second_payload["turn_id"],
+        {
+            "turn_id": second_payload["turn_id"],
+            "fingerprint": fingerprint,
+            "stage": "history_committed",
+            "recorded_at": recorded_at,
+            "thread_id": "thr_selftest_txn_history_repeat",
+            "required_event_ids": [f"{second_payload['turn_id']}:in", f"{second_payload['turn_id']}:out"],
+            "has_thread": True,
+            "baseline_thread": baseline_thread,
+            "target_snapshot": target_snapshot,
+            "history_entry": baseline_thread,
+        },
+    )
+
+    recovery = run_cli(store_root, second_payload, "project-turn")
+    replay = run_cli(store_root, second_payload, "project-turn")
+    thread = run_read(store_root, "get-thread", "--thread-id", "thr_selftest_txn_history_repeat")
+    history = run_read(store_root, "list-thread-history", "--thread-id", "thr_selftest_txn_history_repeat")
+
+    assert_equal(recovery["idempotent_replay"], False, "history-committed recovery should finish the transaction")
+    assert_equal(replay["idempotent_replay"], True, "second replay should be idempotent after txn cleanup")
+    assert_equal(thread["meta"]["revision"], 2, "history-committed recovery should preserve revision 2")
+    assert_equal(len(history), 1, "history-committed recovery should not duplicate history")
+    assert_equal(history[0]["meta"]["revision"], 1, "history entry should keep prior revision")
+    assert_equal(len(raw_event_lines(store_root)), 4, "history-committed recovery should not duplicate raw events")
+    assert_equal(txn_path.exists(), False, "history-committed recovery should delete txn file")
+
+
+def test_snapshot_committed_txn_recovery_remains_idempotent(temp_root: Path) -> None:
+    store_root = temp_root / "txn-snapshot-repeat-store"
+    first_payload = {
+        "turn_id": "agent:selftest:txn:snapshot-repeat:0001",
+        "user_text": "第一次记录。",
+        "assistant_text": "已记录第一次。",
+        "thread": {"thread_id": "thr_selftest_txn_snapshot_repeat", "title": "first", "status": "planned"},
+    }
+    second_payload = {
+        "turn_id": "agent:selftest:txn:snapshot-repeat:0002",
+        "user_text": "第二次记录。",
+        "assistant_text": "已记录第二次。",
+        "thread": {"thread_id": "thr_selftest_txn_snapshot_repeat", "title": "second", "status": "planned"},
+    }
+
+    run_cli(store_root, first_payload, "project-turn")
+    baseline_thread = run_read(store_root, "get-thread", "--thread-id", "thr_selftest_txn_snapshot_repeat")
+
+    template_store = temp_root / "txn-snapshot-repeat-template"
+    run_cli(template_store, first_payload, "project-turn")
+    run_cli(template_store, second_payload, "project-turn")
+    template_records = raw_event_records_for_turn(template_store, second_payload["turn_id"])
+    fingerprint = template_records[0]["payload"][TIMELINE_META_KEY]["fingerprint"]
+    recorded_at = template_records[0]["recorded_at"]
+    target_snapshot = run_read(template_store, "get-thread", "--thread-id", "thr_selftest_txn_snapshot_repeat")
+
+    for record in template_records:
+        append_raw_event(store_root, record)
+    thread_snapshot_path(store_root, "thr_selftest_txn_snapshot_repeat").parent.mkdir(parents=True, exist_ok=True)
+    thread_snapshot_path(store_root, "thr_selftest_txn_snapshot_repeat").write_text(
+        json.dumps(target_snapshot, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+    txn_path = write_project_turn_txn(
+        store_root,
+        second_payload["turn_id"],
+        {
+            "turn_id": second_payload["turn_id"],
+            "fingerprint": fingerprint,
+            "stage": "snapshot_committed",
+            "recorded_at": recorded_at,
+            "thread_id": "thr_selftest_txn_snapshot_repeat",
+            "required_event_ids": [f"{second_payload['turn_id']}:in", f"{second_payload['turn_id']}:out"],
+            "has_thread": True,
+            "baseline_thread": baseline_thread,
+            "target_snapshot": target_snapshot,
+            "history_entry": baseline_thread,
+        },
+    )
+
+    recovery = run_cli(store_root, second_payload, "project-turn")
+    replay = run_cli(store_root, second_payload, "project-turn")
+    thread = run_read(store_root, "get-thread", "--thread-id", "thr_selftest_txn_snapshot_repeat")
+    history = run_read(store_root, "list-thread-history", "--thread-id", "thr_selftest_txn_snapshot_repeat")
+
+    assert_equal(recovery["idempotent_replay"], False, "snapshot-committed recovery should finish the transaction")
+    assert_equal(replay["idempotent_replay"], True, "second replay should be idempotent after snapshot-committed recovery")
+    assert_equal(thread["meta"]["revision"], 2, "snapshot-committed recovery should preserve revision 2")
+    assert_equal(len(history), 1, "snapshot-committed recovery should not duplicate history")
+    assert_equal(history[0]["meta"]["revision"], 1, "history entry should keep prior revision")
+    assert_equal(len(raw_event_lines(store_root)), 4, "snapshot-committed recovery should not duplicate raw events")
+    assert_equal(txn_path.exists(), False, "snapshot-committed recovery should delete txn file")
+
+
 def main() -> int:
     temp_root = ROOT / "tmp" / "selftest-run"
     if temp_root.exists():
@@ -691,6 +848,8 @@ def main() -> int:
         test_jsonl_read_modes(temp_root)
         test_existing_thread_inbound_only_recovery_preserves_revision(temp_root)
         test_missing_snapshot_recovery_preserves_multiturn_state(temp_root)
+        test_snapshot_committed_txn_recovery_remains_idempotent(temp_root)
+        test_history_committed_txn_recovery_remains_idempotent(temp_root)
     finally:
         if temp_root.exists():
             shutil.rmtree(temp_root)

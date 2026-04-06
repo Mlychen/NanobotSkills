@@ -186,7 +186,8 @@
   - 事务不存在时回退到现有 replay/repair 推断逻辑
 - 第四段：进行中
   - 已覆盖 `prepared`、`raw_committed`、`snapshot_committed`、`history_committed` 四类事务中断恢复
-  - 下一步继续把“重复恢复不重复 history”扩展成更系统的故障注入矩阵
+  - 已覆盖 `raw_committed`、`snapshot_committed`、`history_committed` 后连续执行恢复 + 重放不重复追加 history 的关键场景
+  - 下一步继续把“重复恢复不重复 history”扩展到 `prepared` 等剩余阶段组合
 
 建议代码组织：
 
@@ -226,7 +227,7 @@
   - snapshot-restore（已覆盖）
   - existing-thread repair（已覆盖）
 - 新增幂等恢复断言：
-  - 同一 `turn_id` 连续重放 2 次以上不产生重复 history（部分覆盖，需继续扩展）
+  - 同一 `turn_id` 连续重放 2 次以上不产生重复 history（`raw_committed` / `snapshot_committed` / `history_committed` 已覆盖，仍可继续扩展）
   - 任一阶段中断后再次执行都收敛到同一最终 snapshot 与 raw event 集合（关键阶段已覆盖）
   - 更新 thread 时 history 条目数与 revision 增量严格一致（已覆盖）
 

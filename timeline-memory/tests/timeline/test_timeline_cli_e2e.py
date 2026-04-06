@@ -214,6 +214,69 @@ def test_project_turn_recovers_from_raw_committed_txn_stage(cli_runner, scratch_
     assert not txn_path.exists()
 
 
+def test_project_turn_repeated_recovery_from_raw_committed_txn_keeps_single_history_entry(
+    cli_runner, scratch_root: Path
+) -> None:
+    store_root = scratch_root / "txn-raw-repeat-store"
+    first_payload = {
+        "turn_id": "agent:e2e:txn:raw-repeat:0001",
+        "user_text": "第一次记录。",
+        "assistant_text": "已记录第一次。",
+        "thread": {"thread_id": "thr_txn_raw_repeat", "title": "first", "status": "planned"},
+    }
+    second_payload = {
+        "turn_id": "agent:e2e:txn:raw-repeat:0002",
+        "user_text": "第二次记录。",
+        "assistant_text": "已记录第二次。",
+        "thread": {"thread_id": "thr_txn_raw_repeat", "title": "second", "status": "planned"},
+    }
+    cli_runner.run_json(store_root, "project-turn", payload=first_payload)
+    baseline_thread = cli_runner.run_json(store_root, "get-thread", args=["--thread-id", "thr_txn_raw_repeat"])
+
+    template_store = scratch_root / "txn-raw-repeat-template"
+    cli_runner.run_json(template_store, "project-turn", payload=first_payload)
+    cli_runner.run_json(template_store, "project-turn", payload=second_payload)
+    template_events = _turn_raw_events(template_store, second_payload["turn_id"])
+    fingerprint = template_events[0]["payload"]["_timeline_memory"]["fingerprint"]
+    recorded_at = template_events[0]["recorded_at"]
+
+    raw_path = store_root / "raw_events.jsonl"
+    with open(raw_path, "a", encoding="utf-8") as handle:
+        for record in template_events:
+            handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+    txn_path = _write_project_turn_txn(
+        store_root,
+        second_payload["turn_id"],
+        {
+            "turn_id": second_payload["turn_id"],
+            "fingerprint": fingerprint,
+            "stage": "raw_committed",
+            "recorded_at": recorded_at,
+            "thread_id": "thr_txn_raw_repeat",
+            "required_event_ids": _required_turn_event_ids(second_payload["turn_id"], has_outbound=True),
+            "has_thread": True,
+            "baseline_thread": baseline_thread,
+            "target_snapshot": None,
+            "history_entry": None,
+        },
+    )
+
+    recovery = cli_runner.run_json(store_root, "project-turn", payload=second_payload)
+    replay = cli_runner.run_json(store_root, "project-turn", payload=second_payload)
+    thread = cli_runner.run_json(store_root, "get-thread", args=["--thread-id", "thr_txn_raw_repeat"])
+    history = cli_runner.run_json(store_root, "list-thread-history", args=["--thread-id", "thr_txn_raw_repeat"])
+
+    assert recovery["idempotent_replay"] is False
+    assert replay["idempotent_replay"] is True
+    assert thread["title"] == "second"
+    assert thread["meta"]["revision"] == 2
+    assert len(history) == 1
+    assert history[0]["meta"]["revision"] == 1
+    assert len(_turn_raw_events(store_root, second_payload["turn_id"])) == 2
+    assert not txn_path.exists()
+
+
 def test_project_turn_recovers_from_snapshot_committed_txn_stage(cli_runner, scratch_root: Path) -> None:
     store_root = scratch_root / "txn-snapshot-committed-store"
     first_payload = {
@@ -274,6 +337,74 @@ def test_project_turn_recovers_from_snapshot_committed_txn_stage(cli_runner, scr
     assert thread["meta"]["revision"] == 2
     assert len(history) == 1
     assert history[0]["meta"]["revision"] == 1
+    assert not txn_path.exists()
+
+
+def test_project_turn_repeated_recovery_from_snapshot_committed_txn_keeps_single_history_entry(
+    cli_runner, scratch_root: Path
+) -> None:
+    store_root = scratch_root / "txn-snapshot-repeat-store"
+    first_payload = {
+        "turn_id": "agent:e2e:txn:snapshot-repeat:0001",
+        "user_text": "第一次记录。",
+        "assistant_text": "已记录第一次。",
+        "thread": {"thread_id": "thr_txn_snapshot_repeat", "title": "first", "status": "planned"},
+    }
+    second_payload = {
+        "turn_id": "agent:e2e:txn:snapshot-repeat:0002",
+        "user_text": "第二次记录。",
+        "assistant_text": "已记录第二次。",
+        "thread": {"thread_id": "thr_txn_snapshot_repeat", "title": "second", "status": "planned"},
+    }
+    cli_runner.run_json(store_root, "project-turn", payload=first_payload)
+    baseline_thread = cli_runner.run_json(store_root, "get-thread", args=["--thread-id", "thr_txn_snapshot_repeat"])
+
+    template_store = scratch_root / "txn-snapshot-repeat-template"
+    cli_runner.run_json(template_store, "project-turn", payload=first_payload)
+    cli_runner.run_json(template_store, "project-turn", payload=second_payload)
+    template_events = _turn_raw_events(template_store, second_payload["turn_id"])
+    fingerprint = template_events[0]["payload"]["_timeline_memory"]["fingerprint"]
+    recorded_at = template_events[0]["recorded_at"]
+    target_snapshot = cli_runner.run_json(template_store, "get-thread", args=["--thread-id", "thr_txn_snapshot_repeat"])
+
+    raw_path = store_root / "raw_events.jsonl"
+    with open(raw_path, "a", encoding="utf-8") as handle:
+        for record in template_events:
+            handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+    _thread_snapshot_path(store_root, "thr_txn_snapshot_repeat").write_text(
+        json.dumps(target_snapshot, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+    txn_path = _write_project_turn_txn(
+        store_root,
+        second_payload["turn_id"],
+        {
+            "turn_id": second_payload["turn_id"],
+            "fingerprint": fingerprint,
+            "stage": "snapshot_committed",
+            "recorded_at": recorded_at,
+            "thread_id": "thr_txn_snapshot_repeat",
+            "required_event_ids": _required_turn_event_ids(second_payload["turn_id"], has_outbound=True),
+            "has_thread": True,
+            "baseline_thread": baseline_thread,
+            "target_snapshot": target_snapshot,
+            "history_entry": baseline_thread,
+        },
+    )
+
+    recovery = cli_runner.run_json(store_root, "project-turn", payload=second_payload)
+    replay = cli_runner.run_json(store_root, "project-turn", payload=second_payload)
+    thread = cli_runner.run_json(store_root, "get-thread", args=["--thread-id", "thr_txn_snapshot_repeat"])
+    history = cli_runner.run_json(store_root, "list-thread-history", args=["--thread-id", "thr_txn_snapshot_repeat"])
+
+    assert recovery["idempotent_replay"] is False
+    assert replay["idempotent_replay"] is True
+    assert thread["title"] == "second"
+    assert thread["meta"]["revision"] == 2
+    assert len(history) == 1
+    assert history[0]["meta"]["revision"] == 1
+    assert len(_turn_raw_events(store_root, second_payload["turn_id"])) == 2
     assert not txn_path.exists()
 
 
@@ -340,6 +471,77 @@ def test_project_turn_recovers_from_history_committed_txn_stage(cli_runner, scra
     assert thread["meta"]["revision"] == 2
     assert len(history) == 1
     assert history[0]["meta"]["revision"] == 1
+    assert not txn_path.exists()
+
+
+def test_project_turn_repeated_recovery_from_history_committed_txn_keeps_single_history_entry(
+    cli_runner, scratch_root: Path
+) -> None:
+    store_root = scratch_root / "txn-history-repeat-store"
+    first_payload = {
+        "turn_id": "agent:e2e:txn:history-repeat:0001",
+        "user_text": "第一次记录。",
+        "assistant_text": "已记录第一次。",
+        "thread": {"thread_id": "thr_txn_history_repeat", "title": "first", "status": "planned"},
+    }
+    second_payload = {
+        "turn_id": "agent:e2e:txn:history-repeat:0002",
+        "user_text": "第二次记录。",
+        "assistant_text": "已记录第二次。",
+        "thread": {"thread_id": "thr_txn_history_repeat", "title": "second", "status": "planned"},
+    }
+    cli_runner.run_json(store_root, "project-turn", payload=first_payload)
+    baseline_thread = cli_runner.run_json(store_root, "get-thread", args=["--thread-id", "thr_txn_history_repeat"])
+
+    template_store = scratch_root / "txn-history-repeat-template"
+    cli_runner.run_json(template_store, "project-turn", payload=first_payload)
+    cli_runner.run_json(template_store, "project-turn", payload=second_payload)
+    template_events = _turn_raw_events(template_store, second_payload["turn_id"])
+    fingerprint = template_events[0]["payload"]["_timeline_memory"]["fingerprint"]
+    recorded_at = template_events[0]["recorded_at"]
+    target_snapshot = cli_runner.run_json(template_store, "get-thread", args=["--thread-id", "thr_txn_history_repeat"])
+
+    raw_path = store_root / "raw_events.jsonl"
+    with open(raw_path, "a", encoding="utf-8") as handle:
+        for record in template_events:
+            handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+    _thread_snapshot_path(store_root, "thr_txn_history_repeat").write_text(
+        json.dumps(target_snapshot, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    history_path = _thread_history_path(store_root, "thr_txn_history_repeat")
+    history_path.parent.mkdir(parents=True, exist_ok=True)
+    history_path.write_text(json.dumps(baseline_thread, ensure_ascii=False) + "\n", encoding="utf-8")
+
+    txn_path = _write_project_turn_txn(
+        store_root,
+        second_payload["turn_id"],
+        {
+            "turn_id": second_payload["turn_id"],
+            "fingerprint": fingerprint,
+            "stage": "history_committed",
+            "recorded_at": recorded_at,
+            "thread_id": "thr_txn_history_repeat",
+            "required_event_ids": _required_turn_event_ids(second_payload["turn_id"], has_outbound=True),
+            "has_thread": True,
+            "baseline_thread": baseline_thread,
+            "target_snapshot": target_snapshot,
+            "history_entry": baseline_thread,
+        },
+    )
+
+    recovery = cli_runner.run_json(store_root, "project-turn", payload=second_payload)
+    replay = cli_runner.run_json(store_root, "project-turn", payload=second_payload)
+    thread = cli_runner.run_json(store_root, "get-thread", args=["--thread-id", "thr_txn_history_repeat"])
+    history = cli_runner.run_json(store_root, "list-thread-history", args=["--thread-id", "thr_txn_history_repeat"])
+
+    assert recovery["idempotent_replay"] is False
+    assert replay["idempotent_replay"] is True
+    assert thread["title"] == "second"
+    assert thread["meta"]["revision"] == 2
+    assert len(history) == 1
+    assert history[0]["meta"]["revision"] == 1
+    assert len(_turn_raw_events(store_root, second_payload["turn_id"])) == 2
     assert not txn_path.exists()
 
 
