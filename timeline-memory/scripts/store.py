@@ -41,7 +41,18 @@ PROJECT_TURN_WRITE_LOCK_POLL_ENV = "TIMELINE_PROJECT_TURN_WRITE_LOCK_POLL_SECOND
 
 
 class StoreWriteBusyError(RuntimeError):
-    pass
+    def __init__(
+        self,
+        message: str,
+        *,
+        lock_path: Path | None = None,
+        turn_id: str | None = None,
+        thread_id: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.lock_path = str(lock_path) if lock_path is not None else None
+        self.turn_id = turn_id
+        self.thread_id = thread_id
 
 
 def ensure_dir(path: Path) -> Path:
@@ -186,7 +197,12 @@ def acquire_project_turn_write_lock(
                 break
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                raise StoreWriteBusyError(f"store is busy with another writer: {lock_path}")
+                raise StoreWriteBusyError(
+                    f"store is busy with another writer: {lock_path}",
+                    lock_path=lock_path,
+                    turn_id=turn_id,
+                    thread_id=thread_id,
+                )
             time.sleep(min(poll_seconds, remaining))
         _write_lock_metadata(
             handle,

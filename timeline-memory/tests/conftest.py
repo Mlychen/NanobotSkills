@@ -101,6 +101,19 @@ class CliRunner:
         stdout = result.stdout.strip()
         return json.loads(stdout) if stdout else None
 
+    def expect_failure_json(
+        self,
+        store_root: Path,
+        command: str,
+        *,
+        payload: dict | None = None,
+        args: list[str] | None = None,
+    ) -> dict:
+        result = self.run_process(store_root, command, payload=payload, args=args)
+        assert result.returncode != 0, f"expected command to fail: {command}"
+        assert result.stdout.strip() == ""
+        return json.loads(result.stderr)
+
     def expect_failure(
         self,
         store_root: Path,
@@ -109,9 +122,8 @@ class CliRunner:
         payload: dict | None = None,
         args: list[str] | None = None,
     ) -> str:
-        result = self.run_process(store_root, command, payload=payload, args=args)
-        assert result.returncode != 0, f"expected command to fail: {command}"
-        return result.stderr.strip()
+        error = self.expect_failure_json(store_root, command, payload=payload, args=args)
+        return str(error["error"]["message"])
 
 
 @pytest.fixture(scope="session")

@@ -61,7 +61,15 @@ uv run python scripts/timeline_cli.py project-turn --store-root ./timeline-store
 - 默认值是 `compat`，用于保持既有兼容行为。
 - `compat` 会跳过 JSONL 中的坏行和非对象行，适合兼容读取与抢救性操作。
 - `strict` 遇到任一坏行都会立即失败，适合 replay 判定、审计和强一致查询。
-- `strict` 失败时，stderr 会返回稳定格式：`failed to read JSONL: <path> line <n>: <reason>`。
+- 命令执行阶段失败时，`stdout` 保持为空，`stderr` 返回单个 JSON 对象：
+  - `ok = false`
+  - `error.code`
+  - `error.category`
+  - `error.message`
+  - `error.details`
+- 现阶段应优先依赖 `error.code` 做程序分支；`error.message` 继续保留历史关键短语用于人工排障。
+- `strict` 读取失败时，`error.code = TM_READ_FAILED`，`error.message` 继续保留 `failed to read JSONL: <path> line <n>: <reason>` 关键短语。
+- `argparse` 参数解析失败暂未纳入该结构化合同，当前仍保持默认 `usage: ...` 纯文本 `stderr` 与退出码 `2`。
 
 ## `project-turn` 输入合同
 

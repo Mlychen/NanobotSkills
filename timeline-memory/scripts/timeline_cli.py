@@ -4,6 +4,7 @@ import argparse
 import json
 import logging
 import os
+import re
 import sys
 import time
 from dataclasses import dataclass
@@ -28,6 +29,7 @@ from models import (  # noqa: E402
 from store import (  # noqa: E402
     DEFAULT_JSONL_READ_MODE,
     PROJECT_TURN_TXN_STAGE_ORDER,
+    StoreWriteBusyError,
     TimelineStore,
     VALID_JSONL_READ_MODES,
 )
@@ -37,6 +39,38 @@ TIMELINE_META_KEY = "_timeline_memory"
 DEFAULT_SOURCE = "skill://timeline-memory"
 DEFAULT_USER_ACTOR_ID = "user"
 DEFAULT_ASSISTANT_ACTOR_ID = "assistant"
+JSONL_READ_ERROR_PATTERN = re.compile(r"^failed to read JSONL: (?P<path>.+) line (?P<line_no>\d+): (?P<reason>.+)$")
+INPUT_JSON_ERROR_PATTERN = re.compile(
+    r"^failed to parse input JSON: (?P<path>.+) line (?P<line_no>\d+) column (?P<column_no>\d+): (?P<reason>.+)$"
+)
+INPUT_JSON_READ_ERROR_PATTERN = re.compile(r"^failed to read input JSON: (?P<path>.+): (?P<reason>.+)$")
+
+
+class TimelineCliError(RuntimeError):
+    def __init__(
+        self,
+        *,
+        code: str,
+        category: str,
+        message: str,
+        details: dict[str, Any] | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.code = code
+        self.category = category
+        self.message = message
+        self.details = details or {}
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "ok": False,
+            "error": {
+                "code": self.code,
+                "category": self.category,
+                "message": self.message,
+                "details": self.details,
+            },
+        }
 
 
 def now_iso() -> str:
@@ -44,15 +78,30 @@ def now_iso() -> str:
 
 
 def read_input_json(path: str | None) -> dict:
-    if path:
-        return json.loads(Path(path).read_text(encoding="utf-8"))
-    return json.load(sys.stdin)
+    source = path or "<stdin>"
+    try:
+        if path:
+            return json.loads(Path(path).read_text(encoding="utf-8"))
+        return json.load(sys.stdin)
+    except json.JSONDecodeError as exc:
+        raise ValueError(
+            f"failed to parse input JSON: {source} line {exc.lineno} column {exc.colno}: {exc.msg}"
+        ) from exc
+    except OSError as exc:
+        reason = exc.strerror or str(exc) or exc.__class__.__name__
+        raise ValueError(f"failed to read input JSON: {source}: {reason}") from exc
 
 
 def emit_json(payload: Any) -> int:
     sys.stdout.write(json.dumps(payload, ensure_ascii=False, indent=2))
     sys.stdout.write("\n")
     return 0
+
+
+def emit_error(error: TimelineCliError) -> int:
+    sys.stderr.write(json.dumps(error.to_dict(), ensure_ascii=False, indent=2))
+    sys.stderr.write("\n")
+    return 1
 
 
 def build_store(args: argparse.Namespace) -> TimelineStore:
@@ -951,6 +1000,188 @@ def cmd_project_turn(args: argparse.Namespace) -> int:
         )
 
 
+def _extract_turn_id(message: str) -> str | None:
+    patterns = (
+        r"for (?P<turn_id>[^ )]+)",
+        r"does not belong to (?P<turn_id>[^ )]+)",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, message)
+        if match is not None:
+            return match.group("turn_id")
+    return None
+
+
+def _details_with_turn_id(message: str) -> dict[str, Any]:
+    turn_id = _extract_turn_id(message)
+    return {"turn_id": turn_id} if turn_id is not None else {}
+
+
+def _read_failed_details(message: str) -> dict[str, Any]:
+    details: dict[str, Any] = {}
+    match = JSONL_READ_ERROR_PATTERN.match(message)
+    if match is not None:
+        details["path"] = match.group("path")
+        details["line_no"] = int(match.group("line_no"))
+        details["reason"] = match.group("reason")
+    return details
+
+
+def _invalid_argument_details(message: str) -> dict[str, Any]:
+    match = INPUT_JSON_ERROR_PATTERN.match(message)
+    if match is not None:
+        return {
+            "path": match.group("path"),
+            "line_no": int(match.group("line_no")),
+            "column_no": int(match.group("column_no")),
+            "reason": match.group("reason"),
+        }
+    match = INPUT_JSON_READ_ERROR_PATTERN.match(message)
+    if match is not None:
+        return {
+            "path": match.group("path"),
+            "reason": match.group("reason"),
+        }
+    return {}
+
+
+def _is_partial_write_message(message: str) -> bool:
+    snippets = (
+        "partial write detected",
+        "project-turn txn.target_snapshot is missing",
+        "replay recovery baseline thread is required",
+        "replay recovery thread_id is required",
+    )
+    return any(snippet in message for snippet in snippets)
+
+
+def _is_metadata_conflict_message(message: str) -> bool:
+    snippets = (
+        "missing _timeline_memory metadata",
+        "inconsistent thread metadata",
+        "inconsistent required event ids",
+        "inconsistent raw event ids",
+        "unexpected role metadata",
+        "does not belong to",
+    )
+    return any(snippet in message for snippet in snippets)
+
+
+def _is_turn_conflict_message(message: str) -> bool:
+    snippets = (
+        "different payload already recorded",
+        "raw event conflict:",
+        "project-turn txn conflict:",
+    )
+    return any(snippet in message for snippet in snippets)
+
+
+def _is_read_failed_message(message: str) -> bool:
+    prefixes = (
+        "failed to read JSONL:",
+        "failed to load raw event:",
+        "failed to load project-turn txn",
+        "failed to load thread history:",
+        "failed to load thread snapshot:",
+        "thread history path mismatch:",
+        "thread snapshot path mismatch:",
+        "snapshot temp file",
+    )
+    return message.startswith(prefixes)
+
+
+def _is_invalid_argument_message(message: str) -> bool:
+    prefixes = (
+        "failed to parse input JSON:",
+        "failed to read input JSON:",
+        "unsupported read mode:",
+    )
+    snippets = (
+        "contains unsupported fields:",
+        "must be a mapping",
+        "must be a JSON object",
+        "must be a list",
+        "must be namespaced",
+        "is required",
+        "must not be empty",
+        "must be one of",
+        "must contain only non-empty strings",
+        "must be a non-negative number",
+        "raw event payload must not contain plan_time or fact_time",
+        "assistant_text is required for outbound events",
+    )
+    return message.startswith(prefixes) or any(snippet in message for snippet in snippets)
+
+
+def classify_cli_error(exc: Exception) -> TimelineCliError:
+    if isinstance(exc, TimelineCliError):
+        return exc
+
+    message = str(exc) or exc.__class__.__name__
+
+    if isinstance(exc, StoreWriteBusyError):
+        details: dict[str, Any] = {
+            "retryable": True,
+            "turn_id": exc.turn_id,
+            "thread_id": exc.thread_id,
+        }
+        if exc.lock_path is not None:
+            details["path"] = exc.lock_path
+        return TimelineCliError(
+            code="TM_STORE_BUSY",
+            category="busy",
+            message=message,
+            details={key: value for key, value in details.items() if value is not None},
+        )
+
+    if _is_partial_write_message(message):
+        return TimelineCliError(
+            code="TM_PARTIAL_WRITE",
+            category="recovery_failed",
+            message=message,
+            details=_details_with_turn_id(message),
+        )
+
+    if _is_metadata_conflict_message(message):
+        return TimelineCliError(
+            code="TM_METADATA_CONFLICT",
+            category="conflict",
+            message=message,
+            details=_details_with_turn_id(message),
+        )
+
+    if _is_turn_conflict_message(message):
+        return TimelineCliError(
+            code="TM_TURN_CONFLICT",
+            category="conflict",
+            message=message,
+            details=_details_with_turn_id(message),
+        )
+
+    if _is_read_failed_message(message):
+        return TimelineCliError(
+            code="TM_READ_FAILED",
+            category="read_failed",
+            message=message,
+            details=_read_failed_details(message),
+        )
+
+    if _is_invalid_argument_message(message):
+        return TimelineCliError(
+            code="TM_INVALID_ARGUMENT",
+            category="invalid_argument",
+            message=message,
+            details=_invalid_argument_details(message),
+        )
+
+    return TimelineCliError(
+        code="TM_INTERNAL",
+        category="internal",
+        message=message,
+        details={"exception_type": exc.__class__.__name__},
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Timeline memory CLI")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -996,8 +1227,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         return args.func(args)
     except Exception as exc:
-        print(str(exc), file=sys.stderr)
-        return 1
+        return emit_error(classify_cli_error(exc))
 
 
 if __name__ == "__main__":

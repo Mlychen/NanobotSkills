@@ -1199,7 +1199,7 @@ def test_list_threads_orders_by_absolute_time_across_offsets(cli_runner, scratch
 
 def test_project_turn_rejects_context_recorded_at(cli_runner, scratch_root: Path) -> None:
     store_root = scratch_root / "reject-recorded-at-store"
-    error = cli_runner.expect_failure(
+    error = cli_runner.expect_failure_json(
         store_root,
         "project-turn",
         payload={
@@ -1210,7 +1210,23 @@ def test_project_turn_rejects_context_recorded_at(cli_runner, scratch_root: Path
         },
     )
 
-    assert "context contains unsupported fields: recorded_at" in error
+    assert error["error"]["code"] == "TM_INVALID_ARGUMENT"
+    assert "context contains unsupported fields: recorded_at" in error["error"]["message"]
+
+
+def test_project_turn_missing_input_file_returns_invalid_argument(cli_runner, scratch_root: Path) -> None:
+    store_root = scratch_root / "missing-input-store"
+    missing_input = scratch_root / "missing-input.json"
+
+    error = cli_runner.expect_failure_json(
+        store_root,
+        "project-turn",
+        args=["--input", str(missing_input)],
+    )
+
+    assert error["error"]["code"] == "TM_INVALID_ARGUMENT"
+    assert error["error"]["details"]["path"] == str(missing_input)
+    assert "failed to read input JSON" in error["error"]["message"]
 
 
 def test_turn_id_conflict_returns_error(cli_runner, scratch_root: Path) -> None:
@@ -1224,7 +1240,7 @@ def test_turn_id_conflict_returns_error(cli_runner, scratch_root: Path) -> None:
             "thread": {"thread_id": "thr_conflict", "title": "conflict", "status": "planned"},
         },
     )
-    error = cli_runner.expect_failure(
+    error = cli_runner.expect_failure_json(
         store_root,
         "project-turn",
         payload={
@@ -1234,7 +1250,8 @@ def test_turn_id_conflict_returns_error(cli_runner, scratch_root: Path) -> None:
         },
     )
 
-    assert "different payload already recorded" in error
+    assert error["error"]["code"] == "TM_TURN_CONFLICT"
+    assert "different payload already recorded" in error["error"]["message"]
 
 
 def test_replay_rejects_outbound_only_partial_write(cli_runner, scratch_root: Path) -> None:
@@ -1252,10 +1269,11 @@ def test_replay_rejects_outbound_only_partial_write(cli_runner, scratch_root: Pa
     broken_store.mkdir(parents=True, exist_ok=True)
     (broken_store / "raw_events.jsonl").write_text(f"{outbound_line}\n", encoding="utf-8")
 
-    error = cli_runner.expect_failure(broken_store, "project-turn", payload=payload)
+    error = cli_runner.expect_failure_json(broken_store, "project-turn", payload=payload)
 
-    assert "partial write detected" in error
-    assert "missing inbound" in error
+    assert error["error"]["code"] == "TM_PARTIAL_WRITE"
+    assert "partial write detected" in error["error"]["message"]
+    assert "missing inbound" in error["error"]["message"]
 
 
 def test_replay_rejects_raw_event_without_timeline_metadata(cli_runner, scratch_root: Path) -> None:
@@ -1274,7 +1292,7 @@ def test_replay_rejects_raw_event_without_timeline_metadata(cli_runner, scratch_
     }
     (store_root / "raw_events.jsonl").write_text(json.dumps(inbound, ensure_ascii=False) + "\n", encoding="utf-8")
 
-    error = cli_runner.expect_failure(
+    error = cli_runner.expect_failure_json(
         store_root,
         "project-turn",
         payload={
@@ -1283,7 +1301,8 @@ def test_replay_rejects_raw_event_without_timeline_metadata(cli_runner, scratch_
         },
     )
 
-    assert "missing _timeline_memory metadata" in error
+    assert error["error"]["code"] == "TM_METADATA_CONFLICT"
+    assert "missing _timeline_memory metadata" in error["error"]["message"]
 
 
 def test_project_turn_default_read_mode_remains_compat_with_malformed_jsonl(cli_runner, scratch_root: Path) -> None:
@@ -1321,17 +1340,19 @@ def test_project_turn_strict_read_mode_fails_on_malformed_jsonl(cli_runner, scra
     raw_path = store_root / "raw_events.jsonl"
     raw_path.write_text("{bad json}\n", encoding="utf-8")
 
-    error = cli_runner.expect_failure(
+    error = cli_runner.expect_failure_json(
         store_root,
         "project-turn",
         payload=payload,
         args=["--read-mode", "strict"],
     )
 
-    assert "failed to read JSONL" in error
-    assert str(raw_path) in error
-    assert "line 1" in error
-    assert "malformed JSON" in error
+    assert error["error"]["code"] == "TM_READ_FAILED"
+    assert "failed to read JSONL" in error["error"]["message"]
+    assert str(raw_path) in error["error"]["message"]
+    assert error["error"]["details"]["path"] == str(raw_path)
+    assert error["error"]["details"]["line_no"] == 1
+    assert "malformed JSON" in error["error"]["message"]
     assert _raw_event_lines(store_root) == ["{bad json}"]
 
 
@@ -1363,7 +1384,7 @@ def test_list_thread_history_strict_read_mode_fails_on_non_object_jsonl(cli_runn
         "list-thread-history",
         args=["--thread-id", "thr_strict_history", "--read-mode", "compat"],
     )
-    error = cli_runner.expect_failure(
+    error = cli_runner.expect_failure_json(
         store_root,
         "list-thread-history",
         args=["--thread-id", "thr_strict_history", "--read-mode", "strict"],
@@ -1371,10 +1392,12 @@ def test_list_thread_history_strict_read_mode_fails_on_non_object_jsonl(cli_runn
 
     assert len(compat_history) == 1
     assert compat_history[0]["title"] == "strict-history"
-    assert "failed to read JSONL" in error
-    assert str(history_path) in error
-    assert "line 1" in error
-    assert "expected JSON object" in error
+    assert error["error"]["code"] == "TM_READ_FAILED"
+    assert "failed to read JSONL" in error["error"]["message"]
+    assert str(history_path) in error["error"]["message"]
+    assert error["error"]["details"]["path"] == str(history_path)
+    assert error["error"]["details"]["line_no"] == 1
+    assert "expected JSON object" in error["error"]["message"]
 
 
 def test_replay_rejects_inconsistent_thread_metadata(cli_runner, scratch_root: Path) -> None:
@@ -1392,9 +1415,10 @@ def test_replay_rejects_inconsistent_thread_metadata(cli_runner, scratch_root: P
     records[0]["payload"]["_timeline_memory"]["thread_id"] = "thr_other"
     raw_path.write_text("\n".join(json.dumps(item, ensure_ascii=False) for item in records) + "\n", encoding="utf-8")
 
-    error = cli_runner.expect_failure(store_root, "project-turn", payload=payload)
+    error = cli_runner.expect_failure_json(store_root, "project-turn", payload=payload)
 
-    assert "inconsistent thread metadata" in error
+    assert error["error"]["code"] == "TM_METADATA_CONFLICT"
+    assert "inconsistent thread metadata" in error["error"]["message"]
 
 
 def test_replay_rejects_partially_reflected_thread_snapshot(cli_runner, scratch_root: Path) -> None:
@@ -1412,9 +1436,10 @@ def test_replay_rejects_partially_reflected_thread_snapshot(cli_runner, scratch_
     snapshot["event_refs"] = [snapshot["event_refs"][0]]
     snapshot_path.write_text(json.dumps(snapshot, ensure_ascii=False, indent=2), encoding="utf-8")
 
-    error = cli_runner.expect_failure(store_root, "project-turn", payload=payload)
+    error = cli_runner.expect_failure_json(store_root, "project-turn", payload=payload)
 
-    assert "thread snapshot partially reflects current turn" in error
+    assert error["error"]["code"] == "TM_PARTIAL_WRITE"
+    assert "thread snapshot partially reflects current turn" in error["error"]["message"]
 
 
 def test_project_turn_real_subprocess_serializes_same_thread_writes(
@@ -1581,5 +1606,7 @@ def test_project_turn_real_subprocess_same_turn_id_conflict_remains_predictable(
     assert first_process.returncode == 0, first_stderr.strip()
     assert second_process.returncode == 1
     assert second_stdout.strip() == ""
-    assert "different payload already recorded" in second_stderr
+    second_error = json.loads(second_stderr)
+    assert second_error["error"]["code"] == "TM_TURN_CONFLICT"
+    assert "different payload already recorded" in second_error["error"]["message"]
     assert json.loads(first_stdout)["idempotent_replay"] is False

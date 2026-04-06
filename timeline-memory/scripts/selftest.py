@@ -70,7 +70,18 @@ def expect_failure(store_root: Path, *args: str, payload: dict | None = None) ->
     result = run_process(store_root, *args, payload=payload)
     if result.returncode == 0:
         raise RuntimeError("expected CLI failure")
-    return result.stderr.strip()
+    if result.stdout.strip():
+        raise RuntimeError("expected failing CLI command to keep stdout empty")
+    return json.loads(result.stderr)["error"]["message"]
+
+
+def expect_failure_json(store_root: Path, *args: str, payload: dict | None = None) -> dict:
+    result = run_process(store_root, *args, payload=payload)
+    if result.returncode == 0:
+        raise RuntimeError("expected CLI failure")
+    if result.stdout.strip():
+        raise RuntimeError("expected failing CLI command to keep stdout empty")
+    return json.loads(result.stderr)
 
 
 def append_raw_event(store_root: Path, record: RawEventRecord | dict[str, object]) -> None:
@@ -451,8 +462,13 @@ def test_source_normalization_and_partial_write_recovery(temp_root: Path) -> Non
         "thread": {"thread_id": "thr_repair_conflict", "title": "conflict", "status": "planned"},
     }
     append_raw_event(conflict_store, build_raw_event(conflict_existing, role="inbound"))
-    conflict_error = expect_failure(conflict_store, "project-turn", payload=conflict_retry)
-    assert_in("different payload already recorded", conflict_error, "conflicting retry should still fail")
+    conflict_error = expect_failure_json(conflict_store, "project-turn", payload=conflict_retry)
+    assert_equal(conflict_error["error"]["code"], "TM_TURN_CONFLICT", "conflicting retry should return turn conflict code")
+    assert_in(
+        "different payload already recorded",
+        conflict_error["error"]["message"],
+        "conflicting retry should still fail",
+    )
 
 
 def test_list_threads_orders_by_absolute_time(temp_root: Path) -> None:
@@ -513,7 +529,7 @@ def test_list_threads_orders_by_absolute_time(temp_root: Path) -> None:
 
 
 def test_context_recorded_at_is_rejected(temp_root: Path) -> None:
-    error = expect_failure(
+    error = expect_failure_json(
         temp_root / "reject-recorded-at-store",
         "project-turn",
         payload={
@@ -523,7 +539,26 @@ def test_context_recorded_at_is_rejected(temp_root: Path) -> None:
             "context": {"recorded_at": "2026-03-24T10:00:00+08:00"},
         },
     )
-    assert_in("context contains unsupported fields: recorded_at", error, "context.recorded_at should be rejected")
+    assert_equal(error["error"]["code"], "TM_INVALID_ARGUMENT", "context.recorded_at should map to invalid argument")
+    assert_in(
+        "context contains unsupported fields: recorded_at",
+        error["error"]["message"],
+        "context.recorded_at should be rejected",
+    )
+
+
+def test_missing_input_file_is_invalid_argument(temp_root: Path) -> None:
+    store_root = temp_root / "missing-input-store"
+    missing_path = temp_root / "missing-input.json"
+    error = expect_failure_json(
+        store_root,
+        "project-turn",
+        "--input",
+        str(missing_path),
+    )
+    assert_equal(error["error"]["code"], "TM_INVALID_ARGUMENT", "missing input file should map to invalid argument")
+    assert_equal(error["error"]["details"]["path"], str(missing_path), "missing input file should expose the input path")
+    assert_in("failed to read input JSON", error["error"]["message"], "missing input file should keep stable message prefix")
 
 
 def test_jsonl_read_modes(temp_root: Path) -> None:
@@ -558,17 +593,19 @@ def test_jsonl_read_modes(temp_root: Path) -> None:
     raw_path = strict_store / "raw_events.jsonl"
     raw_path.write_text("{bad json}\n", encoding="utf-8")
 
-    strict_error = expect_failure(
+    strict_error = expect_failure_json(
         strict_store,
         "project-turn",
         "--read-mode",
         "strict",
         payload=strict_payload,
     )
-    assert_in("failed to read JSONL", strict_error, "strict read mode should fail with stable prefix")
-    assert_in(str(raw_path), strict_error, "strict read mode should report the broken raw_events path")
-    assert_in("line 1", strict_error, "strict read mode should include the broken line number")
-    assert_in("malformed JSON", strict_error, "strict read mode should report malformed JSON")
+    assert_equal(strict_error["error"]["code"], "TM_READ_FAILED", "strict read mode should return read failure code")
+    assert_in("failed to read JSONL", strict_error["error"]["message"], "strict read mode should fail with stable prefix")
+    assert_in(str(raw_path), strict_error["error"]["message"], "strict read mode should report the broken raw_events path")
+    assert_equal(strict_error["error"]["details"]["path"], str(raw_path), "strict read mode should expose the broken path")
+    assert_equal(strict_error["error"]["details"]["line_no"], 1, "strict read mode should expose the broken line number")
+    assert_in("malformed JSON", strict_error["error"]["message"], "strict read mode should report malformed JSON")
     assert_equal(raw_event_lines(strict_store), ["{bad json}"], "strict read mode should not append new raw events")
 
     history_store = temp_root / "strict-history-read-mode-store"
@@ -602,7 +639,7 @@ def test_jsonl_read_modes(temp_root: Path) -> None:
         "--read-mode",
         "compat",
     )
-    strict_history_error = expect_failure(
+    strict_history_error = expect_failure_json(
         history_store,
         "list-thread-history",
         "--thread-id",
@@ -612,10 +649,36 @@ def test_jsonl_read_modes(temp_root: Path) -> None:
     )
     assert_equal(len(compat_history), 1, "compat history read should skip non-object line")
     assert_equal(compat_history[0]["title"], "strict-history", "compat history read should preserve valid history entry")
-    assert_in("failed to read JSONL", strict_history_error, "strict history read should fail with stable prefix")
-    assert_in(str(history_path), strict_history_error, "strict history read should report broken history path")
-    assert_in("line 1", strict_history_error, "strict history read should include the broken line number")
-    assert_in("expected JSON object", strict_history_error, "strict history read should report non-object line")
+    assert_equal(
+        strict_history_error["error"]["code"],
+        "TM_READ_FAILED",
+        "strict history read should return read failure code",
+    )
+    assert_in(
+        "failed to read JSONL",
+        strict_history_error["error"]["message"],
+        "strict history read should fail with stable prefix",
+    )
+    assert_in(
+        str(history_path),
+        strict_history_error["error"]["message"],
+        "strict history read should report broken history path",
+    )
+    assert_equal(
+        strict_history_error["error"]["details"]["path"],
+        str(history_path),
+        "strict history read should expose the broken history path",
+    )
+    assert_equal(
+        strict_history_error["error"]["details"]["line_no"],
+        1,
+        "strict history read should expose the broken line number",
+    )
+    assert_in(
+        "expected JSON object",
+        strict_history_error["error"]["message"],
+        "strict history read should report non-object line",
+    )
 
 
 def test_existing_thread_inbound_only_recovery_preserves_revision(temp_root: Path) -> None:

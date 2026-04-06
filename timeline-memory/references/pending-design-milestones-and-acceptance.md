@@ -358,6 +358,13 @@
 
 ## 里程碑 M4：结构化错误模型
 
+完成情况：
+
+- 已在 [timeline_cli.py](file:///d:/Code/NanobotSkills/timeline-memory/scripts/timeline_cli.py) 落地统一错误对象、错误码映射与结构化 `stderr` 输出
+- 已保持成功路径 `stdout` 合同不变，失败时统一返回 `ok=false` 的 JSON 错误对象
+- 已将 busy / conflict / partial write / read failed / invalid argument / metadata conflict 纳入首批稳定错误码
+- 已补齐 E2E、宿主测试、`selftest.py` 与公开合同文档同步
+
 范围：
 
 - 定义错误码体系与错误类别
@@ -369,6 +376,172 @@
 - 每类核心失败路径都有固定错误码
 - 上层可仅依赖错误码完成重试与分支处理
 - 历史关键错误文案兼容或提供清晰迁移说明
+
+设计结论：
+
+- M4 采用“稳定错误码 + 结构化 stderr JSON + 兼容可读 message”三层模型
+- 失败时 `stdout` 保持为空，结构化错误统一写到 `stderr`
+- `project-turn`、`get-thread`、`list-threads`、`list-thread-history` 四个公开命令都复用同一错误出口
+- `message` 继续保留当前人类可读文案；机器侧只依赖 `error.code`
+- busy / timeout / conflict / strict read failure 等当前已被测试覆盖的失败面，优先进入第一批稳定错误码
+
+为什么现在做 M4：
+
+- 当前 CLI 总出口仍是 [timeline_cli.py:L1213-L1219](file:///d:/Code/NanobotSkills/timeline-memory/scripts/timeline_cli.py#L1213-L1219) 的统一失败出口；在 M4 之前，外部只能靠文本做分支
+- 当前测试中已经有多处对错误字符串做子串断言，例如：
+  - [test_timeline_cli_e2e.py:L1213-L1417](file:///d:/Code/NanobotSkills/timeline-memory/tests/timeline/test_timeline_cli_e2e.py#L1213-L1417)
+  - [test_timeline_memory_skill_integration.py:L182-L208](file:///d:/Code/NanobotSkills/timeline-memory/tests/agent/test_timeline_memory_skill_integration.py#L182-L208)
+- M3 已引入 busy / timeout 语义；如果不尽快结构化，这些语义会先以错误文案形式沉淀成隐式合同
+- 当前 store 层、replay 层、CLI 入口层都直接抛 `ValueError` / `RuntimeError`，但没有统一的“错误类别 -> 错误码 -> 输出模型”映射层
+
+非目标：
+
+- M4 不修改成功返回结构
+- M4 不在本阶段为每个错误分配不同进程退出码；除参数解析层外，命令失败仍保持退出码 `1`
+- M4 不一次性重写所有内部异常类型；优先增加统一包装与映射层
+- M4 不改变现有恢复策略、并发策略与查询语义
+
+错误输出合同：
+
+- 失败时 `stdout` 必须为空
+- 失败时 `stderr` 输出单个 JSON 对象，建议形态：
+
+```json
+{
+  "ok": false,
+  "error": {
+    "code": "TM_STORE_BUSY",
+    "category": "busy",
+    "message": "store is busy with another writer: D:\\store\\_locks\\project_turn.lock",
+    "details": {
+      "retryable": true,
+      "turn_id": "agent:host:busy:0002"
+    }
+  }
+}
+```
+
+- 字段约束：
+  - `ok`
+    - 固定为 `false`
+  - `error.code`
+    - 稳定错误码，供上层程序分支
+  - `error.category`
+    - 粗粒度错误类别，便于聚合统计与重试策略
+  - `error.message`
+    - 面向人工排障，继续保留当前关键文案短语
+  - `error.details`
+    - 非稳定扩展字段；允许附加 `turn_id`、`thread_id`、`path`、`line_no`、`retryable` 等
+
+错误类别建议：
+
+- `invalid_argument`
+  - 输入 payload 非法、字段不允许、schema 校验失败
+- `read_failed`
+  - strict 读取失败、文件损坏、路径内容与 schema 不匹配
+- `conflict`
+  - 同 `turn_id` 非等价重放、txn 指纹冲突、元数据不一致
+- `recovery_failed`
+  - 部分写入检测、恢复前提不成立、快照与 raw state 不一致
+- `busy`
+  - 锁竞争超时、当前 store 存在活跃写者
+- `internal`
+  - 理论上不应暴露给调用方的未分类异常
+
+第一批稳定错误码：
+
+- `TM_INVALID_ARGUMENT`
+  - 对应非法输入、未知字段、payload/schema/业务参数非法
+- `TM_READ_FAILED`
+  - 对应 strict 读失败、JSONL 坏行、snapshot/history/txn 加载失败
+- `TM_TURN_CONFLICT`
+  - 对应同 `turn_id` 非等价 payload、txn fingerprint 冲突
+- `TM_PARTIAL_WRITE`
+  - 对应 partial write detected、missing inbound、thread snapshot partially reflects current turn
+- `TM_METADATA_CONFLICT`
+  - 对应 inconsistent thread metadata、missing `_timeline_memory` metadata 等元数据问题
+- `TM_STORE_BUSY`
+  - 对应锁等待超时、store is busy with another writer
+- `TM_INTERNAL`
+  - 其他未归类异常的保底码
+
+映射原则：
+
+- 同一错误码可以覆盖多条历史 message，但同一 message 前缀不要在不同错误码间来回漂移
+- `message` 允许继续包含当前断言依赖的关键短语，例如：
+  - `different payload already recorded`
+  - `partial write detected`
+  - `failed to read JSONL`
+  - `store is busy with another writer`
+- 这样即使调用方短期内尚未切到 JSON 解析，基于子串的旧检测逻辑也更容易平滑过渡
+- `details` 中的具体路径、行号、锁文件名允许继续变化，但其字段名一旦公开后应保持稳定
+
+当前实现观察：
+
+- 当前参数解析错误主要由 `argparse` 直接处理；该路径会保留现状，不纳入第一步改造范围
+- 当前参数解析错误与业务输入错误要分开看：
+  - `argparse` 层的 CLI 解析失败暂不纳入第一步结构化改造
+  - 命令执行阶段的 payload/schema/业务参数错误进入 `TM_INVALID_ARGUMENT`
+- 当前命令执行错误已统一落到 [main](file:///d:/Code/NanobotSkills/timeline-memory/scripts/timeline_cli.py#L1213-L1219) 的通用异常出口，并在这里完成“异常 -> 结构化错误对象”的集中映射
+- 当前 store 层已有比较明确的错误前缀，可作为首版映射基础：
+  - [store.py:L310-L335](file:///d:/Code/NanobotSkills/timeline-memory/scripts/store.py#L310-L335)
+  - [store.py:L384-L404](file:///d:/Code/NanobotSkills/timeline-memory/scripts/store.py#L384-L404)
+- 当前 replay / recovery 路径也已有较稳定的冲突文案，可先按 message 前缀分组映射，再逐步收敛为显式异常类型
+
+推荐落地顺序：
+
+- 第一段：定义错误对象与错误码表
+  - 在 CLI 层新增统一错误模型，例如 `TimelineCliError`
+  - 明确 `code`、`category`、`message`、`details` 四个核心字段
+  - 整理首批稳定错误码表与 message 前缀映射关系
+
+- 第二段：改造统一错误出口
+  - 将 [main](file:///d:/Code/NanobotSkills/timeline-memory/scripts/timeline_cli.py#L1213-L1219) 从纯文本 stderr 改为结构化 JSON stderr
+  - 保持命令失败退出码 `1`
+  - 确保成功路径 `stdout` 合同完全不变
+
+- 第三段：优先接入核心失败面
+  - 锁竞争超时 -> `TM_STORE_BUSY`
+  - `turn_id` 冲突 -> `TM_TURN_CONFLICT`
+  - partial write / recovery mismatch -> `TM_PARTIAL_WRITE`
+  - strict read failure / 文件损坏 -> `TM_READ_FAILED`
+  - 非法字段 / schema 问题 -> `TM_INVALID_ARGUMENT`
+
+- 第四段：补兼容回归与迁移说明
+  - 将现有“字符串包含”断言升级为“错误码断言 + message 兼容断言”
+  - 宿主测试补“仅依赖错误码分支”用例
+  - 在 `SKILL.md` / `schema.md` 中同步错误输出合同
+
+分步实现计划：
+
+- P1：已完成
+  - 定义首批错误码
+  - 定义 category 枚举与详情字段约定
+  - 验收：文档与代码内映射表一致
+
+- P2：已完成
+  - 将通用异常出口改为 JSON stderr
+  - 保留 `message` 的历史可读文本
+  - 验收：成功输出不变，失败输出具备稳定 `error.code`
+
+- P3：已完成
+  - busy / timeout
+  - conflict / replay conflict
+  - partial write / recovery mismatch
+  - strict read / load failure
+  - invalid argument
+  - 验收：关键 E2E 与宿主测试不再仅依赖 message 才能分支
+
+- P4：已完成
+  - 更新 [SKILL.md](file:///d:/Code/NanobotSkills/timeline-memory/SKILL.md) 与 [schema.md](file:///d:/Code/NanobotSkills/timeline-memory/references/schema.md)
+  - 提供迁移说明：旧调用方可继续读取 `message`，新调用方应切到 `error.code`
+  - 验收：文档、CLI、测试三者一致
+
+当前建议：
+
+- M4 第一版优先做“稳定错误码 + 统一 stderr JSON”，不要先追求很复杂的层级化异常体系
+- 先覆盖最有业务价值的失败面：busy、conflict、partial write、strict read、invalid argument
+- 等错误码稳定后，再决定是否细分更多子码，避免一开始把码表切得过碎
 
 ## 里程碑 M5：高级事件语义
 

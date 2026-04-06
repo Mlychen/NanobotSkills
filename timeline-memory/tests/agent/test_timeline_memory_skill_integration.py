@@ -205,4 +205,9 @@ def test_host_adapter_reports_busy_writer_timeout(repo_root: Path, scratch_root:
 
     assert second_process.returncode == 1
     assert second_stdout.strip() == ""
-    assert "store is busy with another writer" in second_stderr
+    error = json.loads(second_stderr)
+    assert error["error"]["code"] == "TM_STORE_BUSY"
+    assert error["error"]["category"] == "busy"
+    assert error["error"]["details"]["retryable"] is True
+    assert error["error"]["details"]["turn_id"] == second_payload["turn_id"]
+    assert "store is busy with another writer" in error["error"]["message"]

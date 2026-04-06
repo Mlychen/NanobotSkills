@@ -235,5 +235,20 @@
 - 默认 `read-mode` 为 `compat`
 - `compat`：JSONL 坏行与非对象行会被跳过，保持兼容读取
 - `strict`：JSONL 任一坏行都会导致命令失败
-- `strict` 失败文案格式：`failed to read JSONL: <path> line <n>: <reason>`
-- 失败：stderr 输出错误，退出码非 0
+- 命令执行阶段失败：`stdout` 为空，`stderr` 输出单个 JSON 对象，退出码非 `0`
+- 失败对象固定包含：
+  - `ok = false`
+  - `error.code`
+  - `error.category`
+  - `error.message`
+  - `error.details`
+- 首批稳定错误码：
+  - `TM_INVALID_ARGUMENT`
+  - `TM_READ_FAILED`
+  - `TM_TURN_CONFLICT`
+  - `TM_PARTIAL_WRITE`
+  - `TM_METADATA_CONFLICT`
+  - `TM_STORE_BUSY`
+  - `TM_INTERNAL`
+- `strict` 读取失败时，`error.code = TM_READ_FAILED`，且 `error.message` 继续保留 `failed to read JSONL: <path> line <n>: <reason>` 关键短语
+- `argparse` 参数解析失败暂不在该合同内，当前仍输出默认 `usage: ...` 纯文本 `stderr`，退出码为 `2`
