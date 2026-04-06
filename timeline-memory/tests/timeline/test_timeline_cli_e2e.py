@@ -1,6 +1,11 @@
 from __future__ import annotations
 
 import json
+import os
+import shutil
+import subprocess
+import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -131,6 +136,78 @@ def _assert_turn_state_matches_reference(
         assert actual_entry["fact_time"] == expected_entry["fact_time"]
         assert actual_entry["meta"]["revision"] == expected_entry["meta"]["revision"]
         assert _event_ref_ids(actual_entry) == _event_ref_ids(expected_entry)
+
+
+def _resolve_python_command() -> list[str]:
+    if sys.executable and Path(sys.executable).exists():
+        return [sys.executable]
+    uv = shutil.which("uv")
+    if uv is None:
+        raise RuntimeError("current python executable is unavailable and uv not found on PATH")
+    return [uv, "run", "python"]
+
+
+def _real_cli_env(tmp_root: Path, *, extra_env: dict[str, str] | None = None) -> dict[str, str]:
+    env = dict(os.environ)
+    env["PYTHONIOENCODING"] = "utf-8"
+    env["PYTHONUTF8"] = "1"
+    env["TIMELINE_TEST_MODE"] = "sandbox-safe"
+    env["TIMELINE_TEST_TMP_ROOT"] = str(tmp_root)
+    env["TMP"] = str(tmp_root)
+    env["TEMP"] = str(tmp_root)
+    env["TMPDIR"] = str(tmp_root)
+    if extra_env:
+        env.update(extra_env)
+    return env
+
+
+def _start_real_project_turn(
+    repo_root: Path,
+    cli_path: Path,
+    tmp_root: Path,
+    store_root: Path,
+    *,
+    payload: dict,
+    input_name: str,
+    extra_env: dict[str, str] | None = None,
+) -> subprocess.Popen[str]:
+    input_path = store_root.parent / input_name
+    input_path.parent.mkdir(parents=True, exist_ok=True)
+    input_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    command = [
+        *_resolve_python_command(),
+        str(cli_path),
+        "project-turn",
+        "--store-root",
+        str(store_root),
+        "--input",
+        str(input_path),
+    ]
+    return subprocess.Popen(
+        command,
+        cwd=repo_root,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        env=_real_cli_env(tmp_root, extra_env=extra_env),
+    )
+
+
+def _wait_for_lock_owner(store_root: Path, turn_id: str, *, timeout_seconds: float = 2.0) -> None:
+    lock_path = store_root / "_locks" / "project_turn.lock"
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        if lock_path.exists():
+            try:
+                payload = json.loads(lock_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                payload = None
+            if isinstance(payload, dict) and payload.get("turn_id") == turn_id:
+                return
+        time.sleep(0.02)
+    raise AssertionError(f"project-turn lock was not acquired by {turn_id}")
 
 
 def test_project_turn_idempotent_replay_and_query_surface(cli_runner, scratch_root: Path) -> None:
@@ -1338,3 +1415,171 @@ def test_replay_rejects_partially_reflected_thread_snapshot(cli_runner, scratch_
     error = cli_runner.expect_failure(store_root, "project-turn", payload=payload)
 
     assert "thread snapshot partially reflects current turn" in error
+
+
+def test_project_turn_real_subprocess_serializes_same_thread_writes(
+    cli_path: Path,
+    repo_root: Path,
+    cli_runner,
+    scratch_root: Path,
+) -> None:
+    store_root = scratch_root / "concurrent-same-thread-store"
+    cli_runner.run_json(
+        store_root,
+        "project-turn",
+        payload={
+            "turn_id": "agent:e2e:concurrent-thread:0001",
+            "user_text": "先创建线程。",
+            "assistant_text": "已创建。",
+            "thread": {"thread_id": "thr_concurrent", "title": "initial", "status": "planned"},
+        },
+    )
+    first_update = {
+        "turn_id": "agent:e2e:concurrent-thread:0002",
+        "user_text": "第一次并发更新。",
+        "assistant_text": "已更新为 first。",
+        "thread": {"thread_id": "thr_concurrent", "title": "first", "status": "planned"},
+    }
+    second_update = {
+        "turn_id": "agent:e2e:concurrent-thread:0003",
+        "user_text": "第二次并发更新。",
+        "assistant_text": "已更新为 second。",
+        "thread": {"thread_id": "thr_concurrent", "title": "second", "status": "done"},
+    }
+
+    first_process = _start_real_project_turn(
+        repo_root,
+        cli_path,
+        scratch_root,
+        store_root,
+        payload=first_update,
+        input_name="concurrent-thread-first.json",
+        extra_env={"TIMELINE_TEST_PROJECT_TURN_LOCK_HOLD_SECONDS": "0.4"},
+    )
+    try:
+        _wait_for_lock_owner(store_root, first_update["turn_id"])
+        second_process = _start_real_project_turn(
+            repo_root,
+            cli_path,
+            scratch_root,
+            store_root,
+            payload=second_update,
+            input_name="concurrent-thread-second.json",
+        )
+        second_stdout, second_stderr = second_process.communicate(timeout=10)
+    finally:
+        first_stdout, first_stderr = first_process.communicate(timeout=10)
+
+    assert first_process.returncode == 0, first_stderr.strip()
+    assert second_process.returncode == 0, second_stderr.strip()
+
+    first_result = json.loads(first_stdout)
+    second_result = json.loads(second_stdout)
+    thread = cli_runner.run_json(store_root, "get-thread", args=["--thread-id", "thr_concurrent"])
+    history = cli_runner.run_json(store_root, "list-thread-history", args=["--thread-id", "thr_concurrent"])
+
+    assert first_result["thread"]["meta"]["revision"] == 2
+    assert second_result["thread"]["meta"]["revision"] == 3
+    assert thread["title"] == "second"
+    assert thread["status"] == "done"
+    assert thread["meta"]["revision"] == 3
+    assert [entry["meta"]["revision"] for entry in history] == [1, 2]
+    assert [entry["title"] for entry in history] == ["initial", "first"]
+
+
+def test_project_turn_real_subprocess_same_turn_id_stays_idempotent_under_lock_contention(
+    cli_path: Path,
+    repo_root: Path,
+    cli_runner,
+    scratch_root: Path,
+) -> None:
+    store_root = scratch_root / "concurrent-same-turn-store"
+    payload = {
+        "turn_id": "agent:e2e:concurrent-idempotent:0001",
+        "user_text": "并发提交相同 turn。",
+        "assistant_text": "应该只写一次。",
+        "thread": {"thread_id": "thr_concurrent_idempotent", "title": "same-turn", "status": "planned"},
+    }
+
+    first_process = _start_real_project_turn(
+        repo_root,
+        cli_path,
+        scratch_root,
+        store_root,
+        payload=payload,
+        input_name="concurrent-idempotent-first.json",
+        extra_env={"TIMELINE_TEST_PROJECT_TURN_LOCK_HOLD_SECONDS": "0.4"},
+    )
+    try:
+        _wait_for_lock_owner(store_root, payload["turn_id"])
+        second_process = _start_real_project_turn(
+            repo_root,
+            cli_path,
+            scratch_root,
+            store_root,
+            payload=payload,
+            input_name="concurrent-idempotent-second.json",
+        )
+        second_stdout, second_stderr = second_process.communicate(timeout=10)
+    finally:
+        first_stdout, first_stderr = first_process.communicate(timeout=10)
+
+    assert first_process.returncode == 0, first_stderr.strip()
+    assert second_process.returncode == 0, second_stderr.strip()
+
+    results = [json.loads(first_stdout), json.loads(second_stdout)]
+    thread = cli_runner.run_json(store_root, "get-thread", args=["--thread-id", "thr_concurrent_idempotent"])
+
+    assert sorted(result["idempotent_replay"] for result in results) == [False, True]
+    assert len(_turn_raw_events(store_root, payload["turn_id"])) == 2
+    assert thread["meta"]["revision"] == 1
+    assert not _project_turn_txn_path(store_root, payload["turn_id"]).exists()
+
+
+def test_project_turn_real_subprocess_same_turn_id_conflict_remains_predictable(
+    cli_path: Path,
+    repo_root: Path,
+    scratch_root: Path,
+) -> None:
+    store_root = scratch_root / "concurrent-conflict-store"
+    first_payload = {
+        "turn_id": "agent:e2e:concurrent-conflict:0001",
+        "user_text": "先提交一版。",
+        "assistant_text": "第一版。",
+        "thread": {"thread_id": "thr_concurrent_conflict", "title": "first", "status": "planned"},
+    }
+    conflicting_payload = {
+        "turn_id": "agent:e2e:concurrent-conflict:0001",
+        "user_text": "先提交一版。",
+        "assistant_text": "冲突版本。",
+        "thread": {"thread_id": "thr_concurrent_conflict", "title": "conflict", "status": "planned"},
+    }
+
+    first_process = _start_real_project_turn(
+        repo_root,
+        cli_path,
+        scratch_root,
+        store_root,
+        payload=first_payload,
+        input_name="concurrent-conflict-first.json",
+        extra_env={"TIMELINE_TEST_PROJECT_TURN_LOCK_HOLD_SECONDS": "0.4"},
+    )
+    try:
+        _wait_for_lock_owner(store_root, first_payload["turn_id"])
+        second_process = _start_real_project_turn(
+            repo_root,
+            cli_path,
+            scratch_root,
+            store_root,
+            payload=conflicting_payload,
+            input_name="concurrent-conflict-second.json",
+        )
+        second_stdout, second_stderr = second_process.communicate(timeout=10)
+    finally:
+        first_stdout, first_stderr = first_process.communicate(timeout=10)
+
+    assert first_process.returncode == 0, first_stderr.strip()
+    assert second_process.returncode == 1
+    assert second_stdout.strip() == ""
+    assert "different payload already recorded" in second_stderr
+    assert json.loads(first_stdout)["idempotent_replay"] is False

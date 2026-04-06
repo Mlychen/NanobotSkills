@@ -11,6 +11,11 @@ import pytest
 
 
 ALLOWED_COMMANDS = {"project-turn", "get-thread", "list-threads", "list-thread-history"}
+SCRIPT_DIR = Path(__file__).resolve().parents[2] / "scripts"
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
+
+from store import acquire_project_turn_write_lock
 
 
 def resolve_python_command() -> list[str]:
@@ -77,6 +82,7 @@ class TimelineMemoryHostAdapter:
         store_root: Path,
         payload: dict | None = None,
         args: list[str] | None = None,
+        extra_env: dict[str, str] | None = None,
     ) -> dict | list | None:
         input_path = None
         if payload is not None:
@@ -92,14 +98,41 @@ class TimelineMemoryHostAdapter:
             text=True,
             encoding="utf-8",
             errors="replace",
-            env=self._env(),
+            env={**self._env(), **(extra_env or {})},
             check=False,
         )
         assert result.returncode == 0, result.stderr.strip() or f"command failed: {command}"
         stdout = result.stdout.strip()
         return json.loads(stdout) if stdout else None
 
+    def start_process(
+        self,
+        command: str,
+        *,
+        store_root: Path,
+        payload: dict | None = None,
+        args: list[str] | None = None,
+        extra_env: dict[str, str] | None = None,
+        input_name: str | None = None,
+    ) -> subprocess.Popen[str]:
+        input_path = None
+        if payload is not None:
+            filename = input_name or f"host-{command}-input.json"
+            input_path = store_root.parent / filename
+            input_path.parent.mkdir(parents=True, exist_ok=True)
+            input_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
 
+        argv = self.build_command(command, store_root=store_root, input_path=input_path, args=args)
+        return subprocess.Popen(
+            argv,
+            cwd=self.skill_root,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            env={**self._env(), **(extra_env or {})},
+        )
 def test_discovery_failure_reports_missing_cli(scratch_root: Path, test_mode: str) -> None:
     with pytest.raises(FileNotFoundError, match="timeline_cli.py"):
         TimelineMemoryHostAdapter(scratch_root / "missing-skill", tmp_root=scratch_root, test_mode=test_mode)
@@ -144,3 +177,32 @@ def test_host_adapter_e2e_write_and_read_contract(repo_root: Path, scratch_root:
     assert thread["title"] == "host-thread"
     assert len(threads) == 1
     assert history == []
+
+
+def test_host_adapter_reports_busy_writer_timeout(repo_root: Path, scratch_root: Path, test_mode: str) -> None:
+    adapter = TimelineMemoryHostAdapter(repo_root, tmp_root=scratch_root, test_mode=test_mode)
+    store_root = scratch_root / "host-busy-store"
+    second_payload = {
+        "turn_id": "agent:host:busy:0002",
+        "user_text": "第二个写者。",
+        "assistant_text": "应该超时。",
+        "thread": {"thread_id": "thr_host_busy", "title": "busy-thread-2", "status": "planned"},
+    }
+
+    with acquire_project_turn_write_lock(
+        store_root,
+        turn_id="agent:host:busy:hold",
+        thread_id="thr_host_busy",
+    ):
+        second_process = adapter.start_process(
+            "project-turn",
+            store_root=store_root,
+            payload=second_payload,
+            input_name="host-busy-second.json",
+            extra_env={"TIMELINE_PROJECT_TURN_WRITE_LOCK_TIMEOUT_SECONDS": "0.1"},
+        )
+        second_stdout, second_stderr = second_process.communicate(timeout=10)
+
+    assert second_process.returncode == 1
+    assert second_stdout.strip() == ""
+    assert "store is busy with another writer" in second_stderr

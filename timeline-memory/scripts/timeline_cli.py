@@ -3,7 +3,9 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import sys
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -914,32 +916,39 @@ def cmd_project_turn(args: argparse.Namespace) -> int:
     fingerprint = turn_input.fingerprint()
     thread_id = resolve_thread_id(turn_input)
 
-    recovered = recover_or_replay_project_turn(
-        store,
-        turn_input=turn_input,
-        effective_source=effective_source,
-        fingerprint=fingerprint,
-        thread_id=thread_id,
-    )
-    if recovered is not None:
-        return emit_json(recovered)
+    with store.project_turn_write_lock(turn_id=turn_input.turn_id, thread_id=thread_id):
+        hold_seconds_raw = os.environ.get("TIMELINE_TEST_PROJECT_TURN_LOCK_HOLD_SECONDS")
+        if hold_seconds_raw is not None and hold_seconds_raw.strip():
+            hold_seconds = float(hold_seconds_raw)
+            if hold_seconds > 0:
+                time.sleep(hold_seconds)
 
-    txn = prepare_project_turn_txn(
-        store,
-        turn_input=turn_input,
-        fingerprint=fingerprint,
-        thread_id=thread_id,
-    )
-    return emit_json(
-        execute_project_turn_txn(
+        recovered = recover_or_replay_project_turn(
             store,
             turn_input=turn_input,
             effective_source=effective_source,
             fingerprint=fingerprint,
             thread_id=thread_id,
-            txn=txn,
         )
-    )
+        if recovered is not None:
+            return emit_json(recovered)
+
+        txn = prepare_project_turn_txn(
+            store,
+            turn_input=turn_input,
+            fingerprint=fingerprint,
+            thread_id=thread_id,
+        )
+        return emit_json(
+            execute_project_turn_txn(
+                store,
+                turn_input=turn_input,
+                effective_source=effective_source,
+                fingerprint=fingerprint,
+                thread_id=thread_id,
+                txn=txn,
+            )
+        )
 
 
 def build_parser() -> argparse.ArgumentParser:

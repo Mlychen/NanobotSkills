@@ -2,10 +2,14 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
+import time
 import uuid
+from contextlib import contextmanager
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, BinaryIO, Iterator
 
 from models import RawEventRecord, ThreadMeta, ThreadRecord
 from time_utils import timestamp_sort_key
@@ -30,11 +34,23 @@ PROJECT_TURN_TXN_STAGE_ORDER = {
 }
 DEFAULT_JSONL_READ_MODE = "compat"
 VALID_JSONL_READ_MODES = {"compat", "strict"}
+DEFAULT_PROJECT_TURN_WRITE_LOCK_TIMEOUT_SECONDS = 5.0
+DEFAULT_PROJECT_TURN_WRITE_LOCK_POLL_SECONDS = 0.05
+PROJECT_TURN_WRITE_LOCK_TIMEOUT_ENV = "TIMELINE_PROJECT_TURN_WRITE_LOCK_TIMEOUT_SECONDS"
+PROJECT_TURN_WRITE_LOCK_POLL_ENV = "TIMELINE_PROJECT_TURN_WRITE_LOCK_POLL_SECONDS"
+
+
+class StoreWriteBusyError(RuntimeError):
+    pass
 
 
 def ensure_dir(path: Path) -> Path:
     path.mkdir(parents=True, exist_ok=True)
     return path
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).astimezone().isoformat()
 
 
 def encode_thread_storage_key(thread_id: str) -> str:
@@ -74,6 +90,120 @@ def _require_mapping(payload: Any, name: str) -> dict[str, Any]:
 
 def _temp_path_for(path: Path) -> Path:
     return path.parent / f"{path.name}.{uuid.uuid4().hex}.tmp"
+
+
+def _open_lock_file(path: Path) -> BinaryIO:
+    ensure_dir(path.parent)
+    try:
+        return open(path, "r+b")
+    except FileNotFoundError:
+        return open(path, "w+b")
+
+
+def _try_lock_file(handle: BinaryIO) -> bool:
+    handle.seek(0, os.SEEK_END)
+    if handle.tell() == 0:
+        handle.write(b"\0")
+        handle.flush()
+        os.fsync(handle.fileno())
+    handle.seek(0)
+    if os.name == "nt":
+        import msvcrt
+
+        try:
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+        except OSError:
+            return False
+        return True
+    import fcntl
+
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return False
+    return True
+
+
+def _unlock_file(handle: BinaryIO) -> None:
+    handle.seek(0)
+    if os.name == "nt":
+        import msvcrt
+
+        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+        return
+    import fcntl
+
+    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def _write_lock_metadata(handle: BinaryIO, metadata: dict[str, Any]) -> None:
+    encoded = json.dumps(metadata, ensure_ascii=False, indent=2).encode("utf-8")
+    handle.seek(0)
+    handle.truncate()
+    handle.write(encoded)
+    if not encoded.endswith(b"\n"):
+        handle.write(b"\n")
+    handle.flush()
+    os.fsync(handle.fileno())
+
+
+def _read_env_float(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be a non-negative number") from exc
+    if value < 0:
+        raise ValueError(f"{name} must be a non-negative number")
+    return value
+
+
+@contextmanager
+def acquire_project_turn_write_lock(
+    store_root: Path,
+    *,
+    turn_id: str,
+    thread_id: str | None,
+) -> Iterator[None]:
+    timeout_seconds = _read_env_float(
+        PROJECT_TURN_WRITE_LOCK_TIMEOUT_ENV,
+        DEFAULT_PROJECT_TURN_WRITE_LOCK_TIMEOUT_SECONDS,
+    )
+    poll_seconds = _read_env_float(
+        PROJECT_TURN_WRITE_LOCK_POLL_ENV,
+        DEFAULT_PROJECT_TURN_WRITE_LOCK_POLL_SECONDS,
+    )
+    lock_path = ensure_dir(store_root / "_locks") / "project_turn.lock"
+    deadline = time.monotonic() + timeout_seconds
+    handle = _open_lock_file(lock_path)
+    acquired = False
+    try:
+        while True:
+            if _try_lock_file(handle):
+                acquired = True
+                break
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise StoreWriteBusyError(f"store is busy with another writer: {lock_path}")
+            time.sleep(min(poll_seconds, remaining))
+        _write_lock_metadata(
+            handle,
+            {
+                "pid": os.getpid(),
+                "turn_id": turn_id,
+                "thread_id": thread_id,
+                "acquired_at": _now_iso(),
+            },
+        )
+        yield
+    finally:
+        try:
+            if acquired:
+                _unlock_file(handle)
+        finally:
+            handle.close()
 
 
 def _write_text_atomic(path: Path, text: str) -> None:
@@ -542,3 +672,8 @@ class TimelineStore:
 
     def delete_project_turn_txn(self, turn_id: str) -> None:
         self.project_turn_txns.delete(turn_id)
+
+    @contextmanager
+    def project_turn_write_lock(self, *, turn_id: str, thread_id: str | None) -> Iterator[None]:
+        with acquire_project_turn_write_lock(self.store_root, turn_id=turn_id, thread_id=thread_id):
+            yield

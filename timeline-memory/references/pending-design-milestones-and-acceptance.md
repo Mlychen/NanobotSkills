@@ -252,6 +252,110 @@
 - 双进程并发写同一 `turn_id` 结果可预测且幂等
 - 并发测试可稳定通过，无偶发数据错乱
 
+设计结论：
+
+- M3 先采用“`store-root` 级单写者串行化”策略，而不是一开始就做细粒度 thread 锁
+- 公开 CLI 输入输出合同先保持不变，并发控制只作为内部实现细节引入
+- 锁作用域覆盖整个 `project-turn` 写入主路径：`recover/replay -> prepare txn -> execute txn -> cleanup`
+- 读取命令暂不加锁；M3 只保证“写不互相踩踏”，不额外承诺读到线性化瞬时视图
+- 同一 `turn_id` 继续沿用 M2 的 txn + fingerprint 幂等语义；M3 负责把这套语义放到双进程竞争下依然变成确定结果
+
+为什么先做 store-root 级串行写：
+
+- 当前 `project-turn` 一次写入会同时触碰 `raw_events.jsonl`、`threads/*.json`、`thread_history/*.jsonl`、`_txn/project_turn/*.json`
+- 仅给 thread 加锁仍无法解决 `raw_events.jsonl` 追加和事务文件推进的跨文件竞争
+- 当前 `prepare_project_turn_txn()` 会先读 baseline thread，再生成后续写入计划；没有串行化时，这个 baseline 很容易变成陈旧快照
+- 当前 `ThreadStore.normalize_for_write()` 基于“当前 revision + 1”计算新 revision；双写者并发时会出现两个进程都基于同一旧 revision 计算，从而导致静默覆盖风险
+- 先把所有写入串成单写者，能以最小实现复杂度消除当前最危险的竞态；后续若吞吐成为问题，再评估拆成更细粒度锁
+
+非目标：
+
+- M3 不引入跨主机、跨网络文件系统的一致性保证
+- M3 不修改查询命令返回结构
+- M3 不在本阶段开放新的 CLI 并发参数
+- M3 不追求“读写完全隔离”，只处理写写冲突和同 `turn_id` 幂等竞争
+
+当前实现进展：
+
+- `project-turn` 写入主路径已在 [cmd_project_turn](file:///d:/Code/NanobotSkills/timeline-memory/scripts/timeline_cli.py#L912-L951) 中包裹 `store.project_turn_write_lock(...)`，`recover_or_replay_project_turn()`、`prepare_project_turn_txn()`、`execute_project_turn_txn()` 已统一纳入同一临界区
+- `store-root` 级写锁原语已在 [store.py](file:///d:/Code/NanobotSkills/timeline-memory/scripts/store.py#L164-L213) 中落地，并通过 [TimelineStore.project_turn_write_lock()](file:///d:/Code/NanobotSkills/timeline-memory/scripts/store.py#L676-L679) 暴露给 CLI 主路径
+- 事务文件写入仍由 [ProjectTurnTxnStore.write()](file:///d:/Code/NanobotSkills/timeline-memory/scripts/store.py#L384-L404) 负责单 `turn_id` 幂等合并，但外层已由单写者锁消除不同写者同时推进阶段的竞争
+- raw event 追加与 thread snapshot/history 写入逻辑本身未改公开合同，仍分别位于 [store.py](file:///d:/Code/NanobotSkills/timeline-memory/scripts/store.py#L310-L335) 与 [store.py](file:///d:/Code/NanobotSkills/timeline-memory/scripts/store.py#L592-L603)，但已由同一锁序列化保护
+- 首轮真实并发回归已补齐：
+  - 同 thread 不同 `turn_id` 串行收敛：[test_timeline_cli_e2e.py:L1420-L1487](file:///d:/Code/NanobotSkills/timeline-memory/tests/timeline/test_timeline_cli_e2e.py#L1420-L1487)
+  - 同 `turn_id` 等价并发幂等：[test_timeline_cli_e2e.py:L1490-L1536](file:///d:/Code/NanobotSkills/timeline-memory/tests/timeline/test_timeline_cli_e2e.py#L1490-L1536)
+  - 同 `turn_id` 非等价并发冲突：[test_timeline_cli_e2e.py:L1539-L1585](file:///d:/Code/NanobotSkills/timeline-memory/tests/timeline/test_timeline_cli_e2e.py#L1539-L1585)
+  - 宿主层 busy timeout 冒烟：[test_timeline_memory_skill_integration.py:L182-L208](file:///d:/Code/NanobotSkills/timeline-memory/tests/agent/test_timeline_memory_skill_integration.py#L182-L208)
+
+推荐落地顺序：
+
+- 第一段：补底层锁原语（已完成）
+  - 在 `store-root/_locks/` 下引入固定锁文件路径，例如 `project_turn.lock`
+  - 优先使用操作系统级独占文件锁；进程异常退出时由 OS 自动释放，避免遗留“僵尸锁文件”
+  - 锁文件正文只保留排障元数据：`pid`、`turn_id`、`thread_id`、`acquired_at`
+  - 对外先只提供内部 helper / context manager，不改 CLI 参数
+
+- 第二段：把 `project-turn` 主路径整体包进临界区（已完成）
+  - 将 [cmd_project_turn](file:///d:/Code/NanobotSkills/timeline-memory/scripts/timeline_cli.py#L912-L951) 改为“先拿锁，再执行 replay/prepare/txn/cleanup”
+  - 明确要求：加锁后重新读取 txn 与 baseline，禁止在锁外先做 replay 判断
+  - 保持现有 M2 阶段机不变，只改变其执行前后的并发边界
+  - 对无 thread 的 turn 也保持同一路径加锁，因为仍会写 `raw_events.jsonl` 与 txn 文件
+
+- 第三段：定义等待、失败与重试语义（已完成首版）
+  - 默认行为采用“短等待 + 周期重试 + 超时失败”
+  - 超时后返回明确 busy 错误文本，例如“store is busy with another writer”
+  - 进入 M4 时，需要把 busy / timeout 从当前稳定文本进一步映射为固定错误码，避免把文案本身演化为隐式合同
+  - 相同 `turn_id` 且 payload 等价的竞争提交：一个进程完成真实提交，其他进程在获得锁后走 txn/replay 幂等返回
+  - 相同 `turn_id` 但 payload 不等价：保持现有 fingerprint 冲突失败
+  - 不同 `turn_id` 但同一 thread：后进入者等待前者完成，然后基于最新 snapshot 继续，revision 严格递增
+
+- 第四段：补真实并发测试矩阵（已完成首轮）
+  - 在 pytest 中新增真实 subprocess 并发 helper，避免仅靠进程内 runner 造成“假并发”
+  - 用环境变量形式加入受控故障注入点，确保可以稳定复现“拿到锁后暂停”“snapshot 前暂停”等竞争窗口
+  - 至少覆盖：
+    - 同一 thread、不同 `turn_id` 同时写入，最终 snapshot / history / revision 一致
+    - 同一 `turn_id`、相同 payload 同时写入，最终只写一份结果且返回可预测
+    - 同一 `turn_id`、不同 payload 同时写入，一个成功、一个冲突失败
+    - 前一个写者长时间持锁时，后一个写者超时失败且不产生脏数据
+  - 回归入口保持与统一完成定义一致：pytest、`run-host-tests.py`、必要时 `selftest.py`
+
+分步实现计划：
+
+- P1：锁原语与 busy 错误（已完成）
+  - 新增跨平台文件锁 helper
+  - 约定锁路径与锁元数据 schema
+  - 提供固定超时与退避策略
+  - 验收：双进程争抢同一锁时，一个成功进入，另一个稳定等待或超时失败
+
+- P2：`project-turn` 接入串行化（已完成）
+  - 让 replay / prepare / execute / cleanup 全部在锁内完成
+  - 确保恢复路径与正常写入路径共用同一锁协议
+  - 验收：同一 thread 的并发双写不再出现 revision 丢失或 history 异常
+
+- P3：并发冲突矩阵回归（已完成首轮）
+  - 新增真实 subprocess 并发 E2E
+  - 补宿主层至少一条并发冒烟
+  - 验收：同 `turn_id` 幂等、不同 payload 冲突、持锁超时三类场景稳定复现
+
+当前验证结果：
+
+- `uv run --extra dev python -m pytest -q tests/timeline/test_store_primitives.py tests/timeline/test_timeline_cli_e2e.py tests/agent/test_timeline_memory_skill_integration.py` 已通过
+- `uv run python scripts/run-host-tests.py` 已通过
+- `uv run python scripts/selftest.py` 已通过
+- 当前工作区相关文件 diagnostics 为 `0`
+
+当前判断：
+
+- M3 第一版核心目标已经落地：同一 `store-root` 的 `project-turn` 写入已具备单写者串行化语义
+- 首轮并发测试已覆盖最关键的四类行为：同 thread 串行收敛、同 `turn_id` 幂等、同 `turn_id` 冲突、busy timeout
+- M3 剩余工作不再是“是否需要并发控制”，而是是否继续扩展测试矩阵，以及在 M4 中把当前稳定错误文本收口为结构化错误码
+
+当前建议：
+
+- M3 第一版不要急于做 per-thread 锁、raw-events 锁、txn 锁三层组合
+- 先用 `store-root` 级单写者把语义做对，再看是否值得为吞吐量拆锁
+- 如果后续确实需要细粒度并发，下一轮应基于 M3 已验证的 busy / timeout / replay 语义继续演进，而不是直接推翻第一版
+
 ## 里程碑 M4：结构化错误模型
 
 范围：
