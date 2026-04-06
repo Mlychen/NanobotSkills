@@ -105,9 +105,16 @@
 - 有 `assistant_text` 时写两条 raw event；没有则只写 inbound
 - 有 `thread` 时执行 upsert；没有则不改 thread 快照
 - 内部 event id 由 `turn_id` 派生，例如 `<turn_id>:in`、`<turn_id>:out`
+- 成功写入时，同一 turn 的 inbound / outbound raw event 共享 `correlation_id = turn_id`
+- 成功写入时，inbound `causation_id = null`；若存在 outbound，则其 `causation_id = <turn_id>:in`
+- `project-turn` 第一版不会自动推断 `confidence`；raw event、thread event ref、thread meta 的 `confidence` 默认保持 `null`
+- `project-turn` 为当前 turn 生成 thread 引用时，只自动写 `primary` / `context`：
+  - inbound → `primary`
+  - outbound → `context`
 - `recorded_at` 始终由系统在写入时生成，调用方不能指定
 - 重放请求不得新增 raw event、不得增加 revision
 - 但如果检测到同一 `turn_id` 的可恢复 partial write，允许在重试时补齐缺失的 outbound event 或 thread snapshot
+- 重放与可恢复 repair 后，上述 `correlation_id` / `causation_id` / `event_refs.role` 语义必须保持不漂移
 - 如果省略 `thread.thread_id`，系统会基于 `turn_id` 派生稳定且无碰撞的默认 thread ID
 
 ### `get-thread`
@@ -168,6 +175,10 @@
 
 - `payload` 必须是 object
 - `payload` 不能包含标准化 `plan_time` / `fact_time`
+- `project-turn` 写入时，`correlation_id` 固定等于所属 turn 的 `turn_id`
+- `project-turn` 写入时，inbound `causation_id = null`
+- `project-turn` 写入时，若存在 outbound，则其 `causation_id` 固定回指同 turn 的 inbound `event_id`
+- 第一版 `confidence` 默认保持 `null`；重放与 repair 不会自动补值
 
 ### ThreadRecord
 
@@ -219,6 +230,13 @@
 - `context`
 - `evidence`
 - `derived`
+
+当前 `project-turn` 自动生成规则：
+
+- inbound 事件引用写为 `primary`
+- 同 turn outbound 事件引用写为 `context`
+- `evidence` / `derived` 在第一版中保留枚举位，但不会由 `project-turn` 自动生成
+- `confidence` 第一版默认保持 `null`
 
 ### ThreadMeta
 

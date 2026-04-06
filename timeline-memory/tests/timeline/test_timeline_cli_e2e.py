@@ -37,6 +37,23 @@ def _event_ref_ids(thread_payload: dict) -> list[str]:
     return [ref["event_id"] for ref in thread_payload["event_refs"]]
 
 
+def _turn_event_refs(thread_payload: dict, turn_id: str) -> list[dict]:
+    prefix = f"{turn_id}:"
+    return [ref for ref in thread_payload["event_refs"] if str(ref["event_id"]).startswith(prefix)]
+
+
+def _normalized_event_refs(thread_payload: dict) -> list[tuple[str, str, str, object]]:
+    return [
+        (
+            str(ref["event_id"]),
+            str(ref["role"]),
+            str(ref["added_by"]),
+            ref.get("confidence"),
+        )
+        for ref in thread_payload["event_refs"]
+    ]
+
+
 def _thread_history_path(store_root: Path, thread_id: str) -> Path:
     return store_root / "thread_history" / f"tid_{thread_id.encode('utf-8').hex()}.jsonl"
 
@@ -123,7 +140,7 @@ def _assert_turn_state_matches_reference(
     assert actual_thread["plan_time"] == expected_thread["plan_time"]
     assert actual_thread["fact_time"] == expected_thread["fact_time"]
     assert actual_thread["meta"]["revision"] == expected_thread["meta"]["revision"]
-    assert _event_ref_ids(actual_thread) == _event_ref_ids(expected_thread)
+    assert _normalized_event_refs(actual_thread) == _normalized_event_refs(expected_thread)
 
     actual_history = _read_thread_history(actual_store, thread_id)
     expected_history = _read_thread_history(expected_store, thread_id)
@@ -135,7 +152,39 @@ def _assert_turn_state_matches_reference(
         assert actual_entry["plan_time"] == expected_entry["plan_time"]
         assert actual_entry["fact_time"] == expected_entry["fact_time"]
         assert actual_entry["meta"]["revision"] == expected_entry["meta"]["revision"]
-        assert _event_ref_ids(actual_entry) == _event_ref_ids(expected_entry)
+        assert _normalized_event_refs(actual_entry) == _normalized_event_refs(expected_entry)
+
+
+def _assert_turn_semantics(
+    *,
+    raw_events: list[dict],
+    thread_payload: dict | None,
+    turn_id: str,
+    has_outbound: bool,
+) -> None:
+    inbound_id = f"{turn_id}:in"
+    outbound_id = f"{turn_id}:out"
+    expected_event_ids = [inbound_id, outbound_id] if has_outbound else [inbound_id]
+
+    assert [record["event_id"] for record in raw_events] == expected_event_ids
+    inbound = raw_events[0]
+    assert inbound["correlation_id"] == turn_id
+    assert inbound["causation_id"] is None
+    assert inbound["confidence"] is None
+
+    if has_outbound:
+        outbound = raw_events[1]
+        assert outbound["correlation_id"] == turn_id
+        assert outbound["causation_id"] == inbound_id
+        assert outbound["confidence"] is None
+
+    if thread_payload is None:
+        return
+
+    turn_event_refs = _turn_event_refs(thread_payload, turn_id)
+    assert [ref["event_id"] for ref in turn_event_refs] == expected_event_ids
+    assert [ref["role"] for ref in turn_event_refs] == (["primary", "context"] if has_outbound else ["primary"])
+    assert all(ref["confidence"] is None for ref in turn_event_refs)
 
 
 def _resolve_python_command() -> list[str]:
@@ -236,6 +285,12 @@ def test_project_turn_idempotent_replay_and_query_surface(cli_runner, scratch_ro
     assert thread["title"] == "交电费"
     assert len(threads) == 1
     assert history == []
+    _assert_turn_semantics(
+        raw_events=_turn_raw_events(store_root, payload["turn_id"]),
+        thread_payload=thread,
+        turn_id=payload["turn_id"],
+        has_outbound=True,
+    )
     assert not _project_turn_txn_path(store_root, payload["turn_id"]).exists()
 
 
@@ -313,6 +368,12 @@ def test_project_turn_recovers_from_prepared_txn_stage(cli_runner, scratch_root:
     assert result["recorded_event_ids"] == _required_turn_event_ids(payload["turn_id"], has_outbound=True)
     assert len(_turn_raw_events(store_root, payload["turn_id"])) == 2
     assert thread["title"] == "prepared"
+    _assert_turn_semantics(
+        raw_events=_turn_raw_events(store_root, payload["turn_id"]),
+        thread_payload=thread,
+        turn_id=payload["turn_id"],
+        has_outbound=True,
+    )
     assert not txn_path.exists()
 
 
@@ -979,6 +1040,12 @@ def test_source_normalization_and_partial_write_recovery(cli_runner, scratch_roo
     assert inbound_recovery["recorded_event_ids"] == ["agent:e2e:repair:0001:in", "agent:e2e:repair:0001:out"]
     assert len(_raw_event_lines(inbound_only_store)) == 2
     assert repaired_thread["title"] == "repair"
+    _assert_turn_semantics(
+        raw_events=_turn_raw_events(inbound_only_store, payload["turn_id"]),
+        thread_payload=repaired_thread,
+        turn_id=payload["turn_id"],
+        has_outbound=True,
+    )
 
     no_thread_payload = {
         "turn_id": "agent:e2e:repair:0001-no-thread",
@@ -999,6 +1066,12 @@ def test_source_normalization_and_partial_write_recovery(cli_runner, scratch_roo
     ]
     assert no_thread_replay["thread"] is None
     assert len(_raw_event_lines(no_thread_store)) == 2
+    _assert_turn_semantics(
+        raw_events=_turn_raw_events(no_thread_store, no_thread_payload["turn_id"]),
+        thread_payload=None,
+        turn_id=no_thread_payload["turn_id"],
+        has_outbound=True,
+    )
 
     missing_snapshot_store = scratch_root / "repair-missing-thread"
     missing_payload = {
@@ -1048,6 +1121,12 @@ def test_existing_thread_inbound_only_replay_recovers_next_revision(cli_runner, 
     ]
     assert thread["meta"]["revision"] == 2
     assert thread["title"] == "second"
+    _assert_turn_semantics(
+        raw_events=_turn_raw_events(store_root, second_payload["turn_id"]),
+        thread_payload=thread,
+        turn_id=second_payload["turn_id"],
+        has_outbound=True,
+    )
     assert _event_ref_ids(thread) == [
         "agent:e2e:repair-existing:0001:in",
         "agent:e2e:repair-existing:0001:out",

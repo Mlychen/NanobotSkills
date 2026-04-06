@@ -119,6 +119,8 @@ def build_raw_event(payload: dict, *, role: str, recorded_at: str = "2026-03-24T
         source=source,
         actor_kind=actor_kind,
         actor_id=actor_id,
+        correlation_id=turn_input.turn_id,
+        causation_id=None if role == "inbound" else f"{turn_input.turn_id}:in",
         raw_text=raw_text,
         payload={
             "message": message,
@@ -179,6 +181,56 @@ def event_ref_ids(thread_payload: dict[str, object]) -> list[str]:
     ]
 
 
+def assert_turn_semantics(
+    *,
+    store_root: Path,
+    turn_id: str,
+    thread_payload: dict[str, object] | None,
+    has_outbound: bool,
+) -> None:
+    raw_events = raw_event_records_for_turn(store_root, turn_id)
+    inbound_id = f"{turn_id}:in"
+    outbound_id = f"{turn_id}:out"
+    expected_ids = [inbound_id, outbound_id] if has_outbound else [inbound_id]
+
+    assert_equal([str(record["event_id"]) for record in raw_events], expected_ids, "turn raw events should keep stable ids")
+    assert_equal(raw_events[0].get("correlation_id"), turn_id, "inbound correlation_id should equal turn_id")
+    assert_equal(raw_events[0].get("causation_id"), None, "inbound causation_id should stay empty")
+    assert_equal(raw_events[0].get("confidence"), None, "inbound confidence should stay empty")
+
+    if has_outbound:
+        assert_equal(raw_events[1].get("correlation_id"), turn_id, "outbound correlation_id should equal turn_id")
+        assert_equal(raw_events[1].get("causation_id"), inbound_id, "outbound causation_id should point to inbound")
+        assert_equal(raw_events[1].get("confidence"), None, "outbound confidence should stay empty")
+
+    if thread_payload is None:
+        return
+
+    refs = thread_payload.get("event_refs", [])
+    if not isinstance(refs, list):
+        raise RuntimeError("thread payload event_refs must be a list")
+    turn_refs = [
+        ref
+        for ref in refs
+        if isinstance(ref, dict) and str(ref.get("event_id", "")).startswith(f"{turn_id}:")
+    ]
+    assert_equal(
+        [str(ref["event_id"]) for ref in turn_refs],
+        expected_ids,
+        "thread event refs should keep stable event ids for the turn",
+    )
+    assert_equal(
+        [str(ref["role"]) for ref in turn_refs],
+        ["primary", "context"] if has_outbound else ["primary"],
+        "thread event refs should keep stable primary/context roles",
+    )
+    assert_equal(
+        [ref.get("confidence") for ref in turn_refs],
+        [None] * len(expected_ids),
+        "thread event ref confidence should stay empty",
+    )
+
+
 def assert_equal(actual: object, expected: object, message: str) -> None:
     if actual != expected:
         raise RuntimeError(f"{message}: expected {expected!r}, got {actual!r}")
@@ -217,6 +269,13 @@ def test_regression_basics(temp_root: Path) -> None:
 
     replay = run_cli(store_root, create_payload, "project-turn")
     assert_equal(replay["idempotent_replay"], True, "replay did not return idempotent_replay=true")
+    thread = run_read(store_root, "get-thread", "--thread-id", "thr_selftest_pay_bill")
+    assert_turn_semantics(
+        store_root=store_root,
+        turn_id=create_payload["turn_id"],
+        thread_payload=thread,
+        has_outbound=True,
+    )
 
     update = run_cli(
         store_root,
@@ -407,6 +466,12 @@ def test_source_normalization_and_partial_write_recovery(temp_root: Path) -> Non
     )
     assert_equal(len(raw_event_lines(inbound_only_store)), 2, "inbound-only repair should leave exactly two raw events")
     assert_equal(inbound_recovery["thread"]["meta"]["revision"], 1, "repaired thread should start at revision 1")
+    assert_turn_semantics(
+        store_root=inbound_only_store,
+        turn_id=inbound_only_payload["turn_id"],
+        thread_payload=inbound_recovery["thread"],
+        has_outbound=True,
+    )
 
     no_thread_store = temp_root / "repair-no-thread-store"
     no_thread_payload = {
@@ -426,6 +491,12 @@ def test_source_normalization_and_partial_write_recovery(temp_root: Path) -> Non
     )
     assert_equal(no_thread_recovery["thread"], None, "no-thread repair should keep thread payload empty")
     assert_equal(len(raw_event_lines(no_thread_store)), 2, "no-thread repair should leave exactly two raw events")
+    assert_turn_semantics(
+        store_root=no_thread_store,
+        turn_id=no_thread_payload["turn_id"],
+        thread_payload=None,
+        has_outbound=True,
+    )
 
     missing_thread_store = temp_root / "repair-thread-store"
     missing_thread_payload = {
@@ -706,6 +777,12 @@ def test_existing_thread_inbound_only_recovery_preserves_revision(temp_root: Pat
     history = run_read(store_root, "list-thread-history", "--thread-id", "thr_selftest_existing")
 
     assert_equal(replay["idempotent_replay"], False, "existing-thread replay should repair missing outbound")
+    assert_turn_semantics(
+        store_root=store_root,
+        turn_id=second_payload["turn_id"],
+        thread_payload=thread,
+        has_outbound=True,
+    )
     assert_equal(thread["meta"]["revision"], 2, "existing-thread replay should advance revision to 2")
     assert_equal(
         event_ref_ids(thread),

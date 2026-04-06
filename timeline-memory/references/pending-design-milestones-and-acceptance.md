@@ -611,7 +611,7 @@
 
 - 当前 raw event 序列化结构已经支持上述字段，但 `project-turn` 入口没有赋值逻辑，因此历史数据会大量留空，见 [models.py](file:///d:/Code/NanobotSkills/timeline-memory/scripts/models.py#L49-L97)
 - 当前 thread 引用关系只表达“当前轮第一个事件是 `primary`，其余是 `context`”，这对单轮写入已经足够，但还没有把它上升为公开稳定规则，见 [merge_event_refs()](file:///d:/Code/NanobotSkills/timeline-memory/scripts/timeline_cli.py#L185-L204)
-- 当前 replay 判定依赖 `_timeline_memory.turn_id / fingerprint / role / thread_id`，M5 需要确保新增语义字段不会破坏现有幂等与恢复判断，见 [build_timeline_meta()](file:///d:/Code/NanobotSkills/timeline-memory/scripts/timeline_cli.py#L165-L182) 与 [ensure_replay_metadata_matches()](file:///d:/Code/NanobotSkills/timeline-memory/scripts/timeline_cli.py#L307-L324)
+- 当前 replay 判定依赖 `_timeline_memory.turn_id / fingerprint / role / thread_id`，M5 需要确保 raw event 构造新增的语义字段不会破坏现有幂等与恢复判断，见 [build_raw_event()](file:///d:/Code/NanobotSkills/timeline-memory/scripts/timeline_cli.py#L331-L376) 与 [ensure_replay_metadata_matches()](file:///d:/Code/NanobotSkills/timeline-memory/scripts/timeline_cli.py#L307-L324)
 - 当前 schema 文档对 `ThreadEventRef.role` 只列了枚举值，没有定义“谁来写、何时写、哪些命令会产生哪些 role”，这是 M5 首先要补齐的合同缺口，见 [schema.md](file:///d:/Code/NanobotSkills/timeline-memory/references/schema.md#L197-L220)
 
 推荐落地顺序：
@@ -633,7 +633,7 @@
 
 - 在 `project-turn` 中定义 `correlation_id`、`causation_id`、`confidence` 的写入策略
 - 明确 `event_refs` 角色在证据链中的约束
-- 对多轮归因建立最小可用语义规则
+- 定义单 turn 内最小可用相关性与直接因果语义
 
 验收标准：
 
@@ -660,6 +660,25 @@
   - 更新 `schema.md` 与 `SKILL.md` 中相关字段描述
   - 明确第一版未开放的高级语义能力
   - 验收：文档、实现、测试三者一致
+
+当前实现状态：
+
+- 已完成 M5 第一版最小写入实现：
+  - [build_raw_event()](file:///d:/Code/NanobotSkills/timeline-memory/scripts/timeline_cli.py#L331-L381) 已稳定写入：
+    - inbound / outbound `correlation_id = turn_id`
+    - inbound `causation_id = None`
+    - outbound `causation_id = build_event_id(turn_id, "inbound")`
+    - `confidence` 保持为空
+  - [merge_event_refs()](file:///d:/Code/NanobotSkills/timeline-memory/scripts/timeline_cli.py#L185-L204) 已通过 [project_turn_event_ref_role()](file:///d:/Code/NanobotSkills/timeline-memory/scripts/timeline_cli.py#L383-L384) 显式固化当前 turn 的 `primary/context` 规则
+- 已完成回归覆盖：
+  - [test_timeline_cli_e2e.py](file:///d:/Code/NanobotSkills/timeline-memory/tests/timeline/test_timeline_cli_e2e.py) 已覆盖首次写入、幂等重放、partial write repair、txn recovery 下的字段稳定性
+  - [selftest.py](file:///d:/Code/NanobotSkills/timeline-memory/scripts/selftest.py) 已补最小冒烟，验证单 turn 语义在 repair 路径上保持一致
+- 已完成公开合同同步：
+  - [schema.md](file:///d:/Code/NanobotSkills/timeline-memory/references/schema.md) 已明确 `correlation_id`、`causation_id`、`confidence` 与 `event_refs.role` 的第一版规则
+  - [SKILL.md](file:///d:/Code/NanobotSkills/timeline-memory/SKILL.md) 已同步 `project-turn` 的公开语义保证
+- 当前结论：
+  - M5 P2 / P3 / P4 已完成第一版闭环
+  - `evidence` / `derived` 与显式 `confidence` 输入仍保留为后续里程碑能力，不在本阶段开放
 
 当前建议：
 

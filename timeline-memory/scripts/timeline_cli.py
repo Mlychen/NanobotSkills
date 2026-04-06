@@ -196,7 +196,7 @@ def merge_event_refs(
         merged.append(
             ThreadEventRef(
                 event_id=event_id,
-                role="primary" if index == 0 else "context",
+                role=project_turn_event_ref_role(index),
                 added_at=recorded_at,
                 added_by=source,
             )
@@ -345,6 +345,8 @@ def build_raw_event(
             source=source,
             actor_kind="user",
             actor_id=turn_input.context.actor_id or DEFAULT_USER_ACTOR_ID,
+            correlation_id=turn_input.turn_id,
+            causation_id=None,
             raw_text=turn_input.user_text,
             payload=build_event_payload(
                 text=turn_input.user_text,
@@ -364,6 +366,8 @@ def build_raw_event(
         source=source,
         actor_kind="assistant",
         actor_id=turn_input.context.assistant_actor_id or DEFAULT_ASSISTANT_ACTOR_ID,
+        correlation_id=turn_input.turn_id,
+        causation_id=build_event_id(turn_input.turn_id, "inbound"),
         raw_text=turn_input.assistant_text,
         payload=build_event_payload(
             text=turn_input.assistant_text,
@@ -374,6 +378,10 @@ def build_raw_event(
         ),
         schema_version=1,
     )
+
+
+def project_turn_event_ref_role(index: int) -> str:
+    return "primary" if index == 0 else "context"
 
 
 def resolve_replay_raw_state(

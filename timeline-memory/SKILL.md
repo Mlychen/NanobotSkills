@@ -129,7 +129,14 @@ uv run python scripts/timeline_cli.py project-turn --store-root ./timeline-store
 - 回到同一主题时，先通过 `get-thread` / `list-threads` 找到原来的 `thread_id`，再更新同一条 thread。
 - `project-turn` 会自动生成 raw event、补齐时间戳、维护 revision/history，并返回标准化 thread 快照。
 - `project-turn` 的 `recorded_at` 始终由系统写入时生成，调用方不能指定。
+- `project-turn` 成功写入时，同一 turn 的 inbound / outbound raw event 共享 `correlation_id = turn_id`。
+- `project-turn` 成功写入时，inbound `causation_id` 保持为空；若存在 outbound，则其 `causation_id` 固定回指同 turn 的 inbound event。
+- `project-turn` 为当前 turn 自动生成 thread 引用时，只使用 `primary` / `context`：
+  - inbound → `primary`
+  - outbound → `context`
+- 第一版不会自动推断 `confidence`；raw event、thread event ref、thread meta 的 `confidence` 默认保持为空。
 - 对同一 `turn_id` 的可恢复 partial write，重复调用 `project-turn` 会自动补齐缺失的 outbound event 或 thread snapshot。
+- 对同一 `turn_id` 的重放与可恢复 repair，上述 `correlation_id` / `causation_id` / `event_refs.role` 语义保持稳定，不应漂移。
 - 如果省略 `thread.thread_id`，系统会派生一个稳定但不可读的默认 ID，用来避免不同 `turn_id` 被压到同一条 thread。
 - 对读取结果必须强一致的场景，优先显式传 `--read-mode strict`。
 
