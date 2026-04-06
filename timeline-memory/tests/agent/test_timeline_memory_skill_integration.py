@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
-import sys
 from pathlib import Path
 
 import pytest
@@ -53,7 +53,10 @@ class TimelineMemoryHostAdapter:
         if command != "project-turn" and input_path is not None:
             raise ValueError(f"{command} does not accept input_path")
 
-        argv = [sys.executable, str(self.cli_path), command, "--store-root", str(store_root)]
+        uv = shutil.which("uv")
+        if uv is None:
+            raise RuntimeError("uv not found on PATH")
+        argv = [uv, "run", "python", str(self.cli_path), command, "--store-root", str(store_root)]
         if input_path is not None:
             argv.extend(["--input", str(input_path)])
         if args:

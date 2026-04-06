@@ -156,6 +156,54 @@ def test_project_turn_recovers_from_prepared_txn_stage(cli_runner, scratch_root:
     assert not txn_path.exists()
 
 
+def test_project_turn_repeated_recovery_from_prepared_txn_creates_no_history_on_first_snapshot(
+    cli_runner, scratch_root: Path
+) -> None:
+    store_root = scratch_root / "txn-prepared-repeat-store"
+    payload = {
+        "turn_id": "agent:e2e:txn:prepared-repeat:0001",
+        "user_text": "prepared 阶段重复恢复。",
+        "assistant_text": "继续完成提交。",
+        "thread": {"thread_id": "thr_txn_prepared_repeat", "title": "prepared-repeat", "status": "planned"},
+    }
+    template_store = scratch_root / "txn-prepared-repeat-template"
+    cli_runner.run_json(template_store, "project-turn", payload=payload)
+    template_events = _turn_raw_events(template_store, payload["turn_id"])
+    fingerprint = template_events[0]["payload"]["_timeline_memory"]["fingerprint"]
+    recorded_at = template_events[0]["recorded_at"]
+
+    txn_path = _write_project_turn_txn(
+        store_root,
+        payload["turn_id"],
+        {
+            "turn_id": payload["turn_id"],
+            "fingerprint": fingerprint,
+            "stage": "prepared",
+            "recorded_at": recorded_at,
+            "thread_id": "thr_txn_prepared_repeat",
+            "required_event_ids": _required_turn_event_ids(payload["turn_id"], has_outbound=True),
+            "has_thread": True,
+            "baseline_thread": None,
+            "target_snapshot": None,
+            "history_entry": None,
+        },
+    )
+
+    recovery = cli_runner.run_json(store_root, "project-turn", payload=payload)
+    replay = cli_runner.run_json(store_root, "project-turn", payload=payload)
+    thread = cli_runner.run_json(store_root, "get-thread", args=["--thread-id", "thr_txn_prepared_repeat"])
+    history = cli_runner.run_json(store_root, "list-thread-history", args=["--thread-id", "thr_txn_prepared_repeat"])
+
+    assert recovery["idempotent_replay"] is False
+    assert replay["idempotent_replay"] is True
+    assert recovery["recorded_event_ids"] == _required_turn_event_ids(payload["turn_id"], has_outbound=True)
+    assert len(_turn_raw_events(store_root, payload["turn_id"])) == 2
+    assert thread["title"] == "prepared-repeat"
+    assert thread["meta"]["revision"] == 1
+    assert len(history) == 0
+    assert not txn_path.exists()
+
+
 def test_project_turn_recovers_from_raw_committed_txn_stage(cli_runner, scratch_root: Path) -> None:
     store_root = scratch_root / "txn-raw-committed-store"
     first_payload = {

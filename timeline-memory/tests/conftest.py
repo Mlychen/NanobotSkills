@@ -4,7 +4,6 @@ import json
 import os
 import shutil
 import subprocess
-import sys
 import uuid
 from pathlib import Path
 
@@ -43,7 +42,10 @@ class CliRunner:
         payload: dict | None = None,
         args: list[str] | None = None,
     ) -> subprocess.CompletedProcess[str]:
-        argv = [sys.executable, str(self.cli_path), command, "--store-root", str(store_root)]
+        uv = shutil.which("uv")
+        if uv is None:
+            raise RuntimeError("uv not found on PATH")
+        argv = [uv, "run", "python", str(self.cli_path), command, "--store-root", str(store_root)]
         if args:
             argv.extend(args)
         if payload is not None:

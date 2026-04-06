@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -49,7 +50,10 @@ def build_env(mode: str, tmp_root: Path) -> dict[str, str]:
 
 
 def build_pytest_command(mode: str, extra_args: list[str]) -> list[str]:
-    command = [sys.executable, "-m", "pytest", "--override-ini", "addopts=-q"]
+    uv = shutil.which("uv")
+    if uv is None:
+        raise RuntimeError("uv not found on PATH")
+    command = [uv, "run", "--extra", "dev", "python", "-m", "pytest", "--override-ini", "addopts=-q"]
     if mode == "sandbox-safe":
         command.extend(["-p", "no:tmpdir", "-p", "no:cacheprovider"])
     command.extend(DEFAULT_TESTS)

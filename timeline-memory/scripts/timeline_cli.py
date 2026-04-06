@@ -273,8 +273,12 @@ def build_raw_event(
     )
 
 
-def replay_result(store: TimelineStore, turn_input: ProjectTurnInput) -> dict[str, Any] | None:
-    fingerprint = turn_input.fingerprint()
+def resolve_replay_raw_state(
+    store: TimelineStore,
+    *,
+    turn_input: ProjectTurnInput,
+    fingerprint: str,
+) -> dict[str, Any] | None:
     expected_thread_ids = resolve_replay_thread_ids(turn_input)
     required_event_ids = required_turn_event_ids(turn_input)
     inbound_id = required_event_ids[0]
@@ -297,6 +301,7 @@ def replay_result(store: TimelineStore, turn_input: ProjectTurnInput) -> dict[st
     )
     if thread_id not in expected_thread_ids:
         raise ValueError(f"turn_id conflict: inconsistent thread metadata for {turn_input.turn_id}")
+
     recorded_ids = [inbound.event_id]
     raw_complete = turn_input.assistant_text is None
     needs_repair = False
@@ -314,10 +319,30 @@ def replay_result(store: TimelineStore, turn_input: ProjectTurnInput) -> dict[st
     elif turn_input.assistant_text is not None:
         needs_repair = True
 
+    return {
+        "recorded_at": inbound.recorded_at,
+        "required_event_ids": required_event_ids,
+        "recorded_event_ids": recorded_ids,
+        "thread_id": thread_id,
+        "raw_complete": raw_complete,
+        "needs_repair": needs_repair,
+    }
+
+
+def resolve_replay_thread_state(
+    store: TimelineStore,
+    *,
+    turn_input: ProjectTurnInput,
+    thread_id: str | None,
+    required_event_ids: list[str],
+    raw_complete: bool,
+) -> dict[str, Any]:
     thread_payload = None
     current_thread = None
     baseline_thread = None
     append_history = False
+    needs_repair = False
+
     if turn_input.thread is not None:
         if thread_id is None:
             raise ValueError(f"turn_id conflict: partial write detected for {turn_input.turn_id} (missing thread)")
@@ -341,34 +366,56 @@ def replay_result(store: TimelineStore, turn_input: ProjectTurnInput) -> dict[st
             else:
                 thread_payload = baseline_thread.to_dict()
                 needs_repair = True
-        elif baseline_thread is None:
-            needs_repair = True
         else:
             needs_repair = True
 
-    if needs_repair:
+    return {
+        "thread": thread_payload,
+        "current_thread": current_thread,
+        "baseline_thread": baseline_thread,
+        "append_history": append_history,
+        "needs_repair": needs_repair,
+    }
+
+
+def replay_result(store: TimelineStore, turn_input: ProjectTurnInput) -> dict[str, Any] | None:
+    fingerprint = turn_input.fingerprint()
+    raw_state = resolve_replay_raw_state(store, turn_input=turn_input, fingerprint=fingerprint)
+    if raw_state is None:
+        return None
+    thread_state = resolve_replay_thread_state(
+        store,
+        turn_input=turn_input,
+        thread_id=raw_state["thread_id"],
+        required_event_ids=raw_state["required_event_ids"],
+        raw_complete=raw_state["raw_complete"],
+    )
+
+    if raw_state["needs_repair"] or thread_state["needs_repair"]:
         return {
             "ok": True,
             "idempotent_replay": False,
-            "recorded_event_ids": recorded_ids,
-            "thread": thread_payload,
+            "recorded_event_ids": raw_state["recorded_event_ids"],
+            "thread": thread_state["thread"],
             "_recovery": {
-                "recorded_at": inbound.recorded_at,
+                "recorded_at": raw_state["recorded_at"],
                 "fingerprint": fingerprint,
-                "thread_id": thread_id,
-                "write_outbound": outbound is None and turn_input.assistant_text is not None,
-                "write_thread": turn_input.thread is not None and current_thread is None,
-                "baseline_thread": baseline_thread,
-                "append_history": append_history,
-                "restore_snapshot": current_thread is None and baseline_thread is not None and bool(thread_payload),
+                "thread_id": raw_state["thread_id"],
+                "write_outbound": not raw_state["raw_complete"] and turn_input.assistant_text is not None,
+                "write_thread": turn_input.thread is not None and thread_state["current_thread"] is None,
+                "baseline_thread": thread_state["baseline_thread"],
+                "append_history": thread_state["append_history"],
+                "restore_snapshot": thread_state["current_thread"] is None
+                and thread_state["baseline_thread"] is not None
+                and bool(thread_state["thread"]),
             },
         }
 
     return {
         "ok": True,
         "idempotent_replay": True,
-        "recorded_event_ids": recorded_ids,
-        "thread": thread_payload,
+        "recorded_event_ids": raw_state["recorded_event_ids"],
+        "thread": thread_state["thread"],
     }
 
 
@@ -607,6 +654,90 @@ def execute_project_turn_txn(
     )
 
 
+def execute_replay_recovery(
+    store: TimelineStore,
+    *,
+    turn_input: ProjectTurnInput,
+    replay: dict[str, Any],
+    effective_source: str,
+    fingerprint: str,
+) -> dict[str, Any]:
+    recovery = replay.pop("_recovery", None)
+    if recovery is None:
+        return replay
+
+    recorded_at = recovery["recorded_at"]
+    recorded_ids = list(replay["recorded_event_ids"])
+    baseline_thread = recovery["baseline_thread"]
+    recovery_thread_id = recovery["thread_id"]
+
+    if recovery["write_outbound"]:
+        outbound_event = build_raw_event(
+            turn_input=turn_input,
+            role="outbound",
+            recorded_at=recorded_at,
+            fingerprint=fingerprint,
+            thread_id=recovery_thread_id,
+            source=effective_source,
+        )
+        store.append_raw_event(outbound_event)
+        recorded_ids.append(outbound_event.event_id)
+
+    thread_payload = replay["thread"]
+    if recovery["restore_snapshot"]:
+        thread_payload = store.write_thread_snapshot(baseline_thread).to_dict()
+    elif recovery["write_thread"] or baseline_thread is not None:
+        thread_record = build_thread_record(
+            turn_input=turn_input,
+            thread_id=recovery_thread_id,
+            recorded_at=recorded_at,
+            event_ids=recorded_ids,
+            current=baseline_thread,
+            source=effective_source,
+        )
+        thread_payload = store.repair_thread(
+            thread_record,
+            baseline=baseline_thread,
+            append_history=recovery["append_history"],
+        ).to_dict()
+
+    replay["recorded_event_ids"] = recorded_ids
+    replay["thread"] = thread_payload
+    return replay
+
+
+def recover_or_replay_project_turn(
+    store: TimelineStore,
+    *,
+    turn_input: ProjectTurnInput,
+    effective_source: str,
+    fingerprint: str,
+    thread_id: str | None,
+) -> dict[str, Any] | None:
+    txn = store.get_project_turn_txn(turn_input.turn_id)
+    if txn is not None:
+        return execute_project_turn_txn(
+            store,
+            turn_input=turn_input,
+            effective_source=effective_source,
+            fingerprint=fingerprint,
+            thread_id=thread_id,
+            txn=txn,
+        )
+
+    replay = replay_result(store, turn_input)
+    if replay is None:
+        return None
+
+    return execute_replay_recovery(
+        store,
+        turn_input=turn_input,
+        replay=replay,
+        effective_source=effective_source,
+        fingerprint=fingerprint,
+    )
+
+
 def cmd_get_thread(args: argparse.Namespace) -> int:
     store = build_store(args)
     record = store.get_thread(args.thread_id)
@@ -632,63 +763,15 @@ def cmd_project_turn(args: argparse.Namespace) -> int:
     fingerprint = turn_input.fingerprint()
     thread_id = resolve_thread_id(turn_input)
 
-    txn = store.get_project_turn_txn(turn_input.turn_id)
-    if txn is not None:
-        return emit_json(
-            execute_project_turn_txn(
-                store,
-                turn_input=turn_input,
-                effective_source=effective_source,
-                fingerprint=fingerprint,
-                thread_id=thread_id,
-                txn=txn,
-            )
-        )
-
-    replay = replay_result(store, turn_input)
-    if replay is not None:
-        recovery = replay.pop("_recovery", None)
-        if recovery is None:
-            return emit_json(replay)
-
-        recorded_at = recovery["recorded_at"]
-        recorded_ids = list(replay["recorded_event_ids"])
-        baseline_thread = recovery["baseline_thread"]
-        recovery_thread_id = recovery["thread_id"]
-
-        if recovery["write_outbound"]:
-            outbound_event = build_raw_event(
-                turn_input=turn_input,
-                role="outbound",
-                recorded_at=recorded_at,
-                fingerprint=fingerprint,
-                thread_id=recovery_thread_id,
-                source=effective_source,
-            )
-            store.append_raw_event(outbound_event)
-            recorded_ids.append(outbound_event.event_id)
-
-        thread_payload = replay["thread"]
-        if recovery["restore_snapshot"]:
-            thread_payload = store.write_thread_snapshot(baseline_thread).to_dict()
-        elif recovery["write_thread"] or baseline_thread is not None:
-            thread_record = build_thread_record(
-                turn_input=turn_input,
-                thread_id=recovery_thread_id,
-                recorded_at=recorded_at,
-                event_ids=recorded_ids,
-                current=baseline_thread,
-                source=effective_source,
-            )
-            thread_payload = store.repair_thread(
-                thread_record,
-                baseline=baseline_thread,
-                append_history=recovery["append_history"],
-            ).to_dict()
-
-        replay["recorded_event_ids"] = recorded_ids
-        replay["thread"] = thread_payload
-        return emit_json(replay)
+    recovered = recover_or_replay_project_turn(
+        store,
+        turn_input=turn_input,
+        effective_source=effective_source,
+        fingerprint=fingerprint,
+        thread_id=thread_id,
+    )
+    if recovered is not None:
+        return emit_json(recovered)
 
     txn = prepare_project_turn_txn(
         store,

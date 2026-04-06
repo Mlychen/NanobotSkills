@@ -4,7 +4,6 @@ import json
 import os
 import shutil
 import subprocess
-import sys
 from pathlib import Path
 
 from models import ProjectTurnInput, RawEventRecord
@@ -25,7 +24,10 @@ def _env() -> dict[str, str]:
 
 
 def run_process(store_root: Path, *args: str, payload: dict | None = None) -> subprocess.CompletedProcess[str]:
-    command = [sys.executable, str(CLI), *args, "--store-root", str(store_root)]
+    uv = shutil.which("uv")
+    if uv is None:
+        raise RuntimeError("uv not found on PATH")
+    command = [uv, "run", "python", str(CLI), *args, "--store-root", str(store_root)]
     if payload is not None:
         input_path = store_root.parent / "input.json"
         input_path.parent.mkdir(parents=True, exist_ok=True)
@@ -699,6 +701,60 @@ def test_missing_snapshot_recovery_preserves_multiturn_state(temp_root: Path) ->
     assert_equal(history_after, history_before, "missing snapshot replay should not duplicate history entries")
 
 
+def test_prepared_txn_recovery_remains_idempotent(temp_root: Path) -> None:
+    store_root = temp_root / "txn-prepared-repeat-store"
+    payload = {
+        "turn_id": "agent:selftest:txn:prepared-repeat:0001",
+        "user_text": "prepared 阶段重复恢复。",
+        "assistant_text": "继续完成提交。",
+        "thread": {
+            "thread_id": "thr_selftest_txn_prepared_repeat",
+            "title": "prepared-repeat",
+            "status": "planned",
+        },
+    }
+
+    template_store = temp_root / "txn-prepared-repeat-template"
+    run_cli(template_store, payload, "project-turn")
+    template_records = raw_event_records_for_turn(template_store, payload["turn_id"])
+    fingerprint = template_records[0]["payload"][TIMELINE_META_KEY]["fingerprint"]
+    recorded_at = template_records[0]["recorded_at"]
+
+    txn_path = write_project_turn_txn(
+        store_root,
+        payload["turn_id"],
+        {
+            "turn_id": payload["turn_id"],
+            "fingerprint": fingerprint,
+            "stage": "prepared",
+            "recorded_at": recorded_at,
+            "thread_id": "thr_selftest_txn_prepared_repeat",
+            "required_event_ids": [f"{payload['turn_id']}:in", f"{payload['turn_id']}:out"],
+            "has_thread": True,
+            "baseline_thread": None,
+            "target_snapshot": None,
+            "history_entry": None,
+        },
+    )
+
+    recovery = run_cli(store_root, payload, "project-turn")
+    replay = run_cli(store_root, payload, "project-turn")
+    thread = run_read(store_root, "get-thread", "--thread-id", "thr_selftest_txn_prepared_repeat")
+    history = run_read(store_root, "list-thread-history", "--thread-id", "thr_selftest_txn_prepared_repeat")
+
+    assert_equal(recovery["idempotent_replay"], False, "prepared recovery should finish the transaction")
+    assert_equal(replay["idempotent_replay"], True, "second replay should be idempotent after prepared recovery")
+    assert_equal(
+        recovery["recorded_event_ids"],
+        [f"{payload['turn_id']}:in", f"{payload['turn_id']}:out"],
+        "prepared recovery should record both raw events exactly once",
+    )
+    assert_equal(thread["meta"]["revision"], 1, "prepared recovery should create revision 1 thread")
+    assert_equal(len(history), 0, "prepared recovery should not append history for first snapshot")
+    assert_equal(len(raw_event_lines(store_root)), 2, "prepared recovery should not duplicate raw events")
+    assert_equal(txn_path.exists(), False, "prepared recovery should delete txn file")
+
+
 def test_history_committed_txn_recovery_remains_idempotent(temp_root: Path) -> None:
     store_root = temp_root / "txn-history-repeat-store"
     first_payload = {
@@ -848,6 +904,7 @@ def main() -> int:
         test_jsonl_read_modes(temp_root)
         test_existing_thread_inbound_only_recovery_preserves_revision(temp_root)
         test_missing_snapshot_recovery_preserves_multiturn_state(temp_root)
+        test_prepared_txn_recovery_remains_idempotent(temp_root)
         test_snapshot_committed_txn_recovery_remains_idempotent(temp_root)
         test_history_committed_txn_recovery_remains_idempotent(temp_root)
     finally:
