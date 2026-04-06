@@ -545,6 +545,90 @@
 
 ## 里程碑 M5：高级事件语义
 
+背景：
+
+- 当前数据模型其实已经为高级事件语义预留了字段，但写入路径尚未定义稳定规则：
+  - [RawEventRecord](file:///d:/Code/NanobotSkills/timeline-memory/scripts/models.py#L49-L97) 已包含 `correlation_id`、`causation_id`、`confidence`
+  - [ThreadEventRef](file:///d:/Code/NanobotSkills/timeline-memory/scripts/models.py#L165-L195) 已包含 `role` 与 `confidence`
+  - [ThreadMeta](file:///d:/Code/NanobotSkills/timeline-memory/scripts/models.py#L198-L224) 已包含聚合级 `confidence`
+- 但当前 `project-turn` 写入主路径里，这些字段还没有稳定赋值策略：
+  - [build_raw_event()](file:///d:/Code/NanobotSkills/timeline-memory/scripts/timeline_cli.py#L331-L376) 当前只稳定写 `event_id / event_type / actor / raw_text / payload`
+  - [merge_event_refs()](file:///d:/Code/NanobotSkills/timeline-memory/scripts/timeline_cli.py#L185-L204) 当前只按“首条 `primary`、后续 `context`”生成最小引用关系
+- 如果不先定义 M5，后续查询增强、跨轮归因与证据链展示都会建立在不稳定的隐式约定上
+
+设计结论：
+
+- M5 第一版只做“最小可用高级事件语义”，不追求完整知识图谱或复杂因果网络
+- 语义单元继续以单次 `project-turn` 为核心；第一版重点保证“单轮内稳定、重放后不漂移、修复后可恢复”
+- `correlation_id` 用于标识同一 turn 内的一组原始事件；同一 `turn_id` 生成的 inbound/outbound 必须共享同一 `correlation_id`
+- `causation_id` 只表达直接因果；第一版只在 outbound 事件上显式回指当前 turn 的 inbound `event_id`
+- `confidence` 第一版采用“保守传播”策略：未显式提供时不强行推断，不为了看起来完整而写入伪精确数值
+- `event_refs.role` 第一版只稳定使用 `primary` 与 `context`；`evidence`、`derived` 在文档中保留语义位，但暂不由 `project-turn` 自动生成
+
+为什么现在做 M5：
+
+- M2 已把多文件写入收敛为可恢复阶段机，M3 已把写写竞争序列化，M4 已把失败输出结构化；现在最缺的是“写进去的事件之间到底是什么语义关系”
+- 当前公开 schema 已暴露 `correlation_id`、`causation_id`、`confidence`、`event_refs.role` 等字段能力，但没有说明何时写、何时留空、重放后是否必须一致，见 [schema.md](file:///d:/Code/NanobotSkills/timeline-memory/references/schema.md#L154-L164) 与 [schema.md](file:///d:/Code/NanobotSkills/timeline-memory/references/schema.md#L208-L228)
+- 如果先做 M6 查询增强，再回头定义事件语义，查询行为会被迫兼容一批历史不一致数据，成本更高
+
+非目标：
+
+- M5 不在第一版开放调用方直接传入任意 `correlation_id` / `causation_id`
+- M5 不在第一版支持跨 thread、跨 turn 的复杂依赖图建模
+- M5 不自动推导 `evidence` / `derived` 引用，也不引入新的公开 CLI 命令
+- M5 不改变 M2/M3 已确立的事务提交协议与恢复阶段划分
+- M5 不在第一版重写 thread 聚合逻辑，只先定义原始事件与最小 `event_refs` 的一致语义
+
+字段语义约束：
+
+- `correlation_id`
+  - 作用：把同一轮 turn 内相关 raw event 归到同一相关组
+  - 第一版规则：默认取 `turn_id`
+  - 约束：同一 `turn_id` 的 inbound/outbound 必须一致；重放与 repair 后不得变化
+- `causation_id`
+  - 作用：表达“本事件直接由哪个上游事件触发”
+  - 第一版规则：
+    - inbound：留空
+    - outbound：固定指向当前 turn 的 inbound `event_id`
+  - 约束：若 outbound 存在，则其 `causation_id` 必须稳定为 `build_event_id(turn_id, "inbound")`
+- `RawEventRecord.confidence`
+  - 作用：表达单条原始事件的可信度
+  - 第一版规则：默认留空；后续若引入显式来源，再按稳定映射写入
+  - 约束：回放与 repair 不得凭空补值或改变已有值
+- `ThreadEventRef.role`
+  - 作用：表达 thread 与事件的关系类型
+  - 第一版规则：
+    - inbound 事件引用写为 `primary`
+    - 同轮 outbound 事件引用写为 `context`
+    - `evidence` / `derived` 暂不自动生成
+  - 约束：重放与 repair 后角色不得漂移
+- `ThreadEventRef.confidence`
+  - 第一版规则：默认留空，不从 raw event 自动拷贝
+- `ThreadMeta.confidence`
+  - 第一版规则：默认留空，不在本阶段定义聚合算法
+
+当前实现观察：
+
+- 当前 raw event 序列化结构已经支持上述字段，但 `project-turn` 入口没有赋值逻辑，因此历史数据会大量留空，见 [models.py](file:///d:/Code/NanobotSkills/timeline-memory/scripts/models.py#L49-L97)
+- 当前 thread 引用关系只表达“当前轮第一个事件是 `primary`，其余是 `context`”，这对单轮写入已经足够，但还没有把它上升为公开稳定规则，见 [merge_event_refs()](file:///d:/Code/NanobotSkills/timeline-memory/scripts/timeline_cli.py#L185-L204)
+- 当前 replay 判定依赖 `_timeline_memory.turn_id / fingerprint / role / thread_id`，M5 需要确保新增语义字段不会破坏现有幂等与恢复判断，见 [build_timeline_meta()](file:///d:/Code/NanobotSkills/timeline-memory/scripts/timeline_cli.py#L165-L182) 与 [ensure_replay_metadata_matches()](file:///d:/Code/NanobotSkills/timeline-memory/scripts/timeline_cli.py#L307-L324)
+- 当前 schema 文档对 `ThreadEventRef.role` 只列了枚举值，没有定义“谁来写、何时写、哪些命令会产生哪些 role”，这是 M5 首先要补齐的合同缺口，见 [schema.md](file:///d:/Code/NanobotSkills/timeline-memory/references/schema.md#L197-L220)
+
+推荐落地顺序：
+
+- 第一段：先把语义规则写清
+  - 固定 `correlation_id`、`causation_id`、`confidence`、`event_refs.role` 的第一版规则
+  - 明确默认值、允许留空的字段与“不自动生成”的边界
+- 第二段：只改 `project-turn` 写入主路径
+  - 在 raw event 构造阶段填充 `correlation_id` / `causation_id`
+  - 在 thread 引用构造阶段固化 `primary/context` 规则
+- 第三段：验证 replay / repair 一致性
+  - 同一 `turn_id` 幂等重放后字段不漂移
+  - M2 中断恢复后字段与一次成功提交结果一致
+- 第四段：再决定是否扩语义面
+  - 评估是否需要开放显式 `confidence`
+  - 评估是否需要在后续里程碑中引入 `evidence` / `derived`
+
 范围：
 
 - 在 `project-turn` 中定义 `correlation_id`、`causation_id`、`confidence` 的写入策略
@@ -556,6 +640,33 @@
 - 相关字段在写入、重放、修复后语义一致
 - `event_refs` 角色使用符合约束且可测试
 - 回放不会破坏归因链和置信度字段
+
+分步实现计划：
+
+- P1：语义合同定稿
+  - 在 `references/schema.md` 与里程碑文档中明确字段定义、默认值与边界
+  - 验收：对每个字段都能回答“何时写、写什么、何时留空、重放后是否必须相同”
+
+- P2：最小写入实现
+  - 在 `project-turn` raw event 构造中写入稳定 `correlation_id` / `causation_id`
+  - 固化 `event_refs.role` 的 `primary/context` 规则
+  - 验收：同一 turn 首次写入结果满足第一版语义合同
+
+- P3：回放与恢复收敛
+  - 补齐重放、partial write repair、txn recovery 后字段一致性的断言
+  - 验收：一次成功提交、重复重放、故障恢复三条路径收敛到同一语义结果
+
+- P4：公开合同同步
+  - 更新 `schema.md` 与 `SKILL.md` 中相关字段描述
+  - 明确第一版未开放的高级语义能力
+  - 验收：文档、实现、测试三者一致
+
+当前建议：
+
+- M5 第一版要刻意收敛，不要一开始就引入“用户可自定义因果图”
+- 先把“单 turn 内 inbound/outbound 的相关性与直接因果”做成稳定合同
+- `confidence` 先保持保守：允许为空，不做未经定义的自动推断
+- `evidence` / `derived` 先保留枚举位，等有明确上游语义来源后再开放自动生成
 
 ## 里程碑 M6：查询能力增强
 
