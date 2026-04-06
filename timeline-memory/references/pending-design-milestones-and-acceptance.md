@@ -191,7 +191,8 @@
   - 已将 replay 推断与恢复流程收敛为显式结构：`ReplayRawState`、`ReplayThreadState`、`ReplayRecoveryPlan`、`ReplayResult`
   - `execute_replay_recovery()` 已改为消费显式 recovery plan，不再依赖内部松散字典约定
   - 宿主测试入口已优先复用当前解释器执行 `pytest`，仅在当前环境缺少 `pytest` 时回退到 `uv run --extra dev`
-  - 下一步可继续压缩 `execute_replay_recovery()` 内部条件分支，进一步收口 replay recovery plan 的表达边界
+  - 已继续把 replay recovery 拆为 raw/thread 两类独立 helper，并用 `thread_action` 收口线程恢复分支
+  - 下一步可考虑继续收敛 replay 与 txn 两条恢复路径里对 thread 构造/落盘的共享编排
 
 建议代码组织：
 

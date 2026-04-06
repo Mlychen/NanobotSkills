@@ -220,10 +220,9 @@ class ReplayRecoveryPlan:
     recorded_at: str
     thread_id: str | None
     write_outbound: bool
-    write_thread: bool
     baseline_thread: ThreadRecord | None
     append_history: bool
-    restore_snapshot: bool
+    thread_action: str
 
 
 @dataclass
@@ -447,12 +446,9 @@ def replay_result(store: TimelineStore, turn_input: ProjectTurnInput) -> ReplayR
                 recorded_at=raw_state.recorded_at,
                 thread_id=raw_state.thread_id,
                 write_outbound=not raw_state.raw_complete and turn_input.assistant_text is not None,
-                write_thread=turn_input.thread is not None and thread_state.current_thread is None,
                 baseline_thread=thread_state.baseline_thread,
                 append_history=thread_state.append_history,
-                restore_snapshot=thread_state.current_thread is None
-                and thread_state.baseline_thread is not None
-                and bool(thread_state.thread),
+                thread_action=resolve_replay_thread_action(turn_input=turn_input, thread_state=thread_state),
             ),
         )
 
@@ -461,6 +457,20 @@ def replay_result(store: TimelineStore, turn_input: ProjectTurnInput) -> ReplayR
         recorded_event_ids=raw_state.recorded_event_ids,
         thread=thread_state.thread,
     )
+
+
+def resolve_replay_thread_action(
+    *,
+    turn_input: ProjectTurnInput,
+    thread_state: ReplayThreadState,
+) -> str:
+    if turn_input.thread is None:
+        return "none"
+    if thread_state.current_thread is None and thread_state.baseline_thread is not None and bool(thread_state.thread):
+        return "restore_snapshot"
+    if thread_state.current_thread is None or thread_state.baseline_thread is not None:
+        return "repair_thread"
+    return "none"
 
 
 def _require_txn_str(txn: dict[str, Any], field_name: str) -> str:
@@ -710,45 +720,82 @@ def execute_replay_recovery(
     if recovery is None:
         return replay.to_payload()
 
-    recorded_at = recovery.recorded_at
-    recorded_ids = list(replay.recorded_event_ids)
-    baseline_thread = recovery.baseline_thread
-    recovery_thread_id = recovery.thread_id
-
-    if recovery.write_outbound:
-        outbound_event = build_raw_event(
-            turn_input=turn_input,
-            role="outbound",
-            recorded_at=recorded_at,
-            fingerprint=fingerprint,
-            thread_id=recovery_thread_id,
-            source=effective_source,
-        )
-        store.append_raw_event(outbound_event)
-        recorded_ids.append(outbound_event.event_id)
-
-    thread_payload = replay.thread
-    if recovery.restore_snapshot:
-        thread_payload = store.write_thread_snapshot(baseline_thread).to_dict()
-    elif recovery.write_thread or baseline_thread is not None:
-        thread_record = build_thread_record(
-            turn_input=turn_input,
-            thread_id=recovery_thread_id,
-            recorded_at=recorded_at,
-            event_ids=recorded_ids,
-            current=baseline_thread,
-            source=effective_source,
-        )
-        thread_payload = store.repair_thread(
-            thread_record,
-            baseline=baseline_thread,
-            append_history=recovery.append_history,
-        ).to_dict()
-
-    replay.recorded_event_ids = recorded_ids
-    replay.thread = thread_payload
+    replay.recorded_event_ids = recover_replay_raw_events(
+        store,
+        turn_input=turn_input,
+        recovery=recovery,
+        effective_source=effective_source,
+        fingerprint=fingerprint,
+        recorded_event_ids=replay.recorded_event_ids,
+    )
+    replay.thread = recover_replay_thread_payload(
+        store,
+        turn_input=turn_input,
+        recovery=recovery,
+        effective_source=effective_source,
+        recorded_event_ids=replay.recorded_event_ids,
+        current_thread_payload=replay.thread,
+    )
     replay.recovery = None
     return replay.to_payload()
+
+
+def recover_replay_raw_events(
+    store: TimelineStore,
+    *,
+    turn_input: ProjectTurnInput,
+    recovery: ReplayRecoveryPlan,
+    effective_source: str,
+    fingerprint: str,
+    recorded_event_ids: list[str],
+) -> list[str]:
+    recovered_ids = list(recorded_event_ids)
+    if not recovery.write_outbound:
+        return recovered_ids
+    outbound_event = build_raw_event(
+        turn_input=turn_input,
+        role="outbound",
+        recorded_at=recovery.recorded_at,
+        fingerprint=fingerprint,
+        thread_id=recovery.thread_id,
+        source=effective_source,
+    )
+    store.append_raw_event(outbound_event)
+    recovered_ids.append(outbound_event.event_id)
+    return recovered_ids
+
+
+def recover_replay_thread_payload(
+    store: TimelineStore,
+    *,
+    turn_input: ProjectTurnInput,
+    recovery: ReplayRecoveryPlan,
+    effective_source: str,
+    recorded_event_ids: list[str],
+    current_thread_payload: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    if recovery.thread_action == "none":
+        return current_thread_payload
+    if recovery.thread_action == "restore_snapshot":
+        baseline_thread = recovery.baseline_thread
+        if baseline_thread is None:
+            raise ValueError("replay recovery baseline thread is required for restore_snapshot")
+        return store.write_thread_snapshot(baseline_thread).to_dict()
+    if recovery.thread_action == "repair_thread":
+        thread_record = build_thread_record(
+            turn_input=turn_input,
+            thread_id=recovery.thread_id,
+            recorded_at=recovery.recorded_at,
+            event_ids=recorded_event_ids,
+            current=recovery.baseline_thread,
+            source=effective_source,
+        )
+        return store.repair_thread(
+            thread_record,
+            baseline=recovery.baseline_thread,
+            append_history=recovery.append_history,
+        ).to_dict()
+    raise ValueError(f"unsupported replay recovery thread action: {recovery.thread_action}")
 
 
 def recover_or_replay_project_turn(
