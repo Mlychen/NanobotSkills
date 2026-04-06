@@ -5,6 +5,7 @@ import os
 import shutil
 import subprocess
 import sys
+import importlib.util
 from pathlib import Path
 
 
@@ -49,11 +50,17 @@ def build_env(mode: str, tmp_root: Path) -> dict[str, str]:
     return env
 
 
-def build_pytest_command(mode: str, extra_args: list[str]) -> list[str]:
+def resolve_pytest_runner() -> list[str]:
+    if importlib.util.find_spec("pytest") is not None:
+        return [sys.executable, "-m", "pytest"]
     uv = shutil.which("uv")
     if uv is None:
         raise RuntimeError("uv not found on PATH")
-    command = [uv, "run", "--extra", "dev", "python", "-m", "pytest", "--override-ini", "addopts=-q"]
+    return [uv, "run", "--extra", "dev", "python", "-m", "pytest"]
+
+
+def build_pytest_command(mode: str, extra_args: list[str]) -> list[str]:
+    command = [*resolve_pytest_runner(), "--override-ini", "addopts=-q"]
     if mode == "sandbox-safe":
         command.extend(["-p", "no:tmpdir", "-p", "no:cacheprovider"])
     command.extend(DEFAULT_TESTS)

@@ -188,7 +188,10 @@
   - 已覆盖 `prepared`、`raw_committed`、`snapshot_committed`、`history_committed` 四类事务中断恢复
   - 已覆盖 `prepared`、`raw_committed`、`snapshot_committed`、`history_committed` 后连续执行恢复 + 重放不重复追加 history 的关键场景
   - 已开始收敛 `timeline_cli.py` 中 txn 恢复与 legacy replay 的重复判断
-  - 下一步可继续细化 replay 推断结果的数据结构边界
+  - 已将 replay 推断与恢复流程收敛为显式结构：`ReplayRawState`、`ReplayThreadState`、`ReplayRecoveryPlan`、`ReplayResult`
+  - `execute_replay_recovery()` 已改为消费显式 recovery plan，不再依赖内部松散字典约定
+  - 宿主测试入口已优先复用当前解释器执行 `pytest`，仅在当前环境缺少 `pytest` 时回退到 `uv run --extra dev`
+  - 下一步可继续压缩 `execute_replay_recovery()` 内部条件分支，进一步收口 replay recovery plan 的表达边界
 
 建议代码组织：
 
