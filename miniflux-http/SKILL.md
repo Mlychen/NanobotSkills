@@ -1,6 +1,6 @@
 ---
 name: miniflux-http
-description: Direct Miniflux HTTP API operation and wrapper design. Use when Codex needs to inspect or mutate Miniflux feeds, entries, categories, users, API keys, or media over authenticated HTTP, or when a task should be expressed as a stable Miniflux command surface instead of ad hoc requests.
+description: "Read and manage RSS feeds via Miniflux. Use when the user wants to view RSS feeds, check categories, read articles, subscribe to feeds, search entries, or manage Miniflux users and API keys. Triggered by: 查看RSS, 新闻, 订阅, feed, category, article, entry, bookmark."
 ---
 
 # Miniflux HTTP

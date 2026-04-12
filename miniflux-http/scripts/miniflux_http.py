@@ -15,6 +15,28 @@ from urllib.parse import urlencode, urljoin
 from urllib.request import Request, urlopen
 
 
+def _load_dotenv():
+    """Load environment variables from ~/.nanobot/.env if available."""
+    dotenv_path = Path.home() / ".nanobot" / ".env"
+    if not dotenv_path.exists():
+        return
+    try:
+        content = dotenv_path.read_text(encoding="utf-8")
+    except OSError:
+        return
+    for line in content.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key, value = key.strip(), value.strip()
+        if key and value and os.getenv(key) is None:
+            os.environ[key] = value
+
+
+_load_dotenv()
+
+
 class CliUsageError(Exception):
     """Raised when the user provides invalid CLI input."""
 
