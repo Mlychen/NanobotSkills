@@ -86,6 +86,11 @@ def add_request_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--raw", action="store_true")
     parser.add_argument("--include-status", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument(
+        "--title-only",
+        action="store_true",
+        help="Only output entry titles and metadata, strip body content.",
+    )
 
 
 def inspect_config(args: argparse.Namespace) -> dict[str, object]:
@@ -216,7 +221,28 @@ def command_show_config(args: argparse.Namespace) -> int:
     return 0 if config["ready"] else 1
 
 
-def render_response(data: bytes, raw: bool, include_status: bool, status: int) -> int:
+BODY_FIELDS = frozenset(
+    (
+        "content",
+        "summary",
+        "hash",
+    )
+)
+
+
+def strip_body(entry: dict) -> dict:
+    """Remove body-level content fields while preserving metadata and nested objects."""
+    return {k: v for k, v in entry.items() if k not in BODY_FIELDS}
+
+
+def render_response(
+    data: bytes,
+    raw: bool,
+    include_status: bool,
+    status: int,
+    *,
+    title_only: bool = False,
+) -> int:
     if include_status:
         write_text(sys.stdout, f"HTTP {status}\n")
         flush_stream(sys.stdout)
@@ -235,6 +261,12 @@ def render_response(data: bytes, raw: bool, include_status: bool, status: int) -
         if data and not data.endswith(b"\n"):
             write_text(sys.stdout, "\n")
         return 0
+
+    if title_only and isinstance(parsed, dict):
+        if "entries" in parsed:
+            parsed["entries"] = [strip_body(e) if isinstance(e, dict) else e for e in parsed["entries"]]
+        else:
+            parsed = strip_body(parsed)
 
     print(json.dumps(parsed, indent=2, ensure_ascii=True))
     return 0
@@ -274,6 +306,7 @@ def command_request(args: argparse.Namespace) -> int:
                 raw=args.raw,
                 include_status=args.include_status,
                 status=response.status,
+                title_only=args.title_only,
             )
     except HTTPError as exc:
         error_body = exc.read()

@@ -196,6 +196,7 @@ class MinifluxHttpRequestErrorTests(unittest.TestCase):
             raw=False,
             include_status=False,
             dry_run=False,
+            title_only=False,
             command="request",
         )
 
@@ -330,6 +331,7 @@ class MinifluxHttpRequestSuccessTests(unittest.TestCase):
             raw=raw,
             include_status=include_status,
             dry_run=False,
+            title_only=False,
             command="request",
         )
 
@@ -370,3 +372,144 @@ class MinifluxHttpRequestSuccessTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class MinifluxHttpRequestTitleOnlyTests(unittest.TestCase):
+    """Tests for --title-only client-side content stripping."""
+
+    def make_args(self) -> argparse.Namespace:
+        return argparse.Namespace(
+            base_url="http://example.test",
+            api_key="secret",
+            username=None,
+            password=None,
+            timeout=30.0,
+            method="GET",
+            path="/v1/entries",
+            query=[],
+            header=[],
+            body_json=None,
+            body_file=None,
+            raw=False,
+            include_status=False,
+            dry_run=False,
+            title_only=True,
+            command="request",
+        )
+
+    def run_request_with_response(
+        self, args: argparse.Namespace, body: bytes, status: int = 200
+    ) -> tuple[int, str]:
+        stdout = StringIO()
+        dummy = DummyHTTPResponse(body)
+        dummy.status = status
+        with patch.object(MODULE, "urlopen", return_value=dummy):
+            with patch.object(sys, "stdout", stdout):
+                code = MODULE.command_request(args)
+        return code, stdout.getvalue()
+
+    def test_title_only_strips_paginated_entries(self) -> None:
+        args = self.make_args()
+        body = json.dumps({
+            "total": 2,
+            "entries": [
+                {"id": 1, "title": "First", "content": "<p>Full text</p>", "summary": "Short", "hash": "abc", "url": "http://x"},
+                {"id": 2, "title": "Second", "content": "<p>More text</p>", "hash": "def", "url": "http://y"},
+            ],
+        }).encode()
+        code, stdout = self.run_request_with_response(args, body)
+        self.assertEqual(code, 0)
+        data = json.loads(stdout)
+        self.assertEqual(data["total"], 2)
+        for entry in data["entries"]:
+            self.assertNotIn("content", entry)
+            self.assertNotIn("summary", entry)
+            self.assertNotIn("hash", entry)
+            self.assertIn("id", entry)
+            self.assertIn("title", entry)
+            self.assertIn("url", entry)
+
+    def test_title_only_strips_single_entry(self) -> None:
+        args = self.make_args()
+        body = json.dumps({
+            "id": 42,
+            "title": "Solo",
+            "content": "<p>Huge article body</p>",
+            "summary": "tl;dr",
+            "hash": "xyz",
+            "feed": {"id": 1, "title": "Feed A"},
+        }).encode()
+        code, stdout = self.run_request_with_response(args, body)
+        self.assertEqual(code, 0)
+        data = json.loads(stdout)
+        self.assertNotIn("content", data)
+        self.assertNotIn("summary", data)
+        self.assertNotIn("hash", data)
+        self.assertEqual(data["title"], "Solo")
+        self.assertIn("feed", data)
+
+    def test_title_only_non_entry_response_unchanged(self) -> None:
+        """Non-entry dicts (e.g. /v1/me) should pass through unchanged."""
+        args = self.make_args()
+        body = json.dumps({"id": 1, "username": "admin", "is_admin": True}).encode()
+        code, stdout = self.run_request_with_response(args, body)
+        self.assertEqual(code, 0)
+        data = json.loads(stdout)
+        self.assertEqual(data["username"], "admin")
+
+    def test_title_only_preserves_nested_objects(self) -> None:
+        """Nested objects like feed, enclosures, tags should remain."""
+        args = self.make_args()
+        body = json.dumps({
+            "id": 10,
+            "title": "Nested Test",
+            "content": "<p>body</p>",
+            "feed": {"id": 3, "title": "Tech"},
+            "enclosures": [{"url": "http://file.mp3", "mime_type": "audio/mpeg"}],
+            "tags": ["python"],
+        }).encode()
+        code, stdout = self.run_request_with_response(args, body)
+        self.assertEqual(code, 0)
+        data = json.loads(stdout)
+        self.assertNotIn("content", data)
+        self.assertEqual(data["feed"]["title"], "Tech")
+        self.assertEqual(len(data["enclosures"]), 1)
+        self.assertEqual(data["tags"], ["python"])
+
+    def test_title_only_false_preserves_content(self) -> None:
+        args = self.make_args()
+        args.title_only = False
+        body = json.dumps({
+            "id": 1,
+            "title": "Full",
+            "content": "<p>All of it</p>",
+            "summary": "Brief",
+        }).encode()
+        code, stdout = self.run_request_with_response(args, body)
+        self.assertEqual(code, 0)
+        data = json.loads(stdout)
+        self.assertIn("content", data)
+        self.assertIn("summary", data)
+
+
+class MinifluxHttpStripBodyUnitTests(unittest.TestCase):
+    """Unit tests for strip_body helper."""
+
+    def test_strips_body_fields(self) -> None:
+        entry = {
+            "id": 1, "title": "T", "content": "x",
+            "summary": "y", "hash": "z", "url": "u",
+        }
+        result = MODULE.strip_body(entry)
+        self.assertEqual(set(result.keys()), {"id", "title", "url"})
+
+    def test_preserves_other_fields(self) -> None:
+        entry = {
+            "id": 2, "title": "T", "feed": {"id": 5},
+            "tags": ["a"], "status": "unread",
+            "content": "gone",
+        }
+        result = MODULE.strip_body(entry)
+        self.assertIn("feed", result)
+        self.assertIn("tags", result)
+        self.assertNotIn("content", result)
