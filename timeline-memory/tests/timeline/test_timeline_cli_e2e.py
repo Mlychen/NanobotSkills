@@ -1585,6 +1585,52 @@ def test_project_turn_rejects_context_recorded_at(cli_runner, scratch_root: Path
     assert "context contains unsupported fields: recorded_at" in error["error"]["message"]
 
 
+@pytest.mark.parametrize(
+    ("suffix", "payload_updates", "expected_message"),
+    [
+        ("context-source-null", {"context": {"source": None}}, "context.source is required"),
+        ("context-actor-id-object", {"context": {"actor_id": {}}}, "context.actor_id must be a string"),
+        (
+            "plan-time-all-day-string",
+            {"thread": {"plan_time": {"all_day": "false"}}},
+            "thread.plan_time.all_day must be a boolean",
+        ),
+        ("plan-time-due-at-bool", {"thread": {"plan_time": {"due_at": False}}}, "thread.plan_time.due_at must be a string"),
+        ("thread-kind-null", {"thread": {"thread_kind": None}}, "thread.thread_kind is required"),
+        ("thread-title-int", {"thread": {"title": 123}}, "thread.title must be a string"),
+        ("content-notes-bool", {"thread": {"content": {"notes": False}}}, "thread.content.notes must be a string"),
+        ("user-text-int", {"user_text": 123}, "user_text must be a string"),
+        ("assistant-text-bool", {"assistant_text": False}, "assistant_text must be a string"),
+    ],
+)
+def test_project_turn_rejects_invalid_contract_types(
+    cli_runner, scratch_root: Path, suffix: str, payload_updates: dict, expected_message: str
+) -> None:
+    store_root = scratch_root / f"reject-contract-types-{suffix}"
+    base_thread = {
+        "thread_id": f"thr_reject_contract_types_{suffix}",
+        "title": "reject",
+        "status": "planned",
+    }
+    payload = {
+        "turn_id": f"agent:e2e:reject-contract-types:{suffix}",
+        "user_text": "类型必须在边界被验证。",
+        "assistant_text": "这是合法回复。",
+        "thread": dict(base_thread),
+    }
+    payload.update(payload_updates)
+    if "thread" in payload_updates:
+        payload["thread"] = {
+            **base_thread,
+            **payload_updates["thread"],
+        }
+
+    error = cli_runner.expect_failure_json(store_root, "project-turn", payload=payload)
+
+    assert error["error"]["code"] == "TM_INVALID_ARGUMENT"
+    assert expected_message in error["error"]["message"]
+
+
 def test_project_turn_missing_input_file_returns_invalid_argument(cli_runner, scratch_root: Path) -> None:
     store_root = scratch_root / "missing-input-store"
     missing_input = scratch_root / "missing-input.json"

@@ -730,6 +730,83 @@ def test_context_recorded_at_is_rejected(temp_root: Path) -> None:
     )
 
 
+def test_project_turn_contract_types_are_rejected(temp_root: Path) -> None:
+    cases = [
+        (
+            "context-source-null",
+            {"context": {"source": None}},
+            "context.source is required",
+        ),
+        (
+            "context-actor-id-object",
+            {"context": {"actor_id": {}}},
+            "context.actor_id must be a string",
+        ),
+        (
+            "plan-time-all-day-string",
+            {"thread": {"plan_time": {"all_day": "false"}}},
+            "thread.plan_time.all_day must be a boolean",
+        ),
+        (
+            "plan-time-due-at-bool",
+            {"thread": {"plan_time": {"due_at": False}}},
+            "thread.plan_time.due_at must be a string",
+        ),
+        (
+            "thread-kind-null",
+            {"thread": {"thread_kind": None}},
+            "thread.thread_kind is required",
+        ),
+        (
+            "thread-title-int",
+            {"thread": {"title": 123}},
+            "thread.title must be a string",
+        ),
+        (
+            "content-notes-bool",
+            {"thread": {"content": {"notes": False}}},
+            "thread.content.notes must be a string",
+        ),
+        (
+            "user-text-int",
+            {"user_text": 123},
+            "user_text must be a string",
+        ),
+        (
+            "assistant-text-bool",
+            {"assistant_text": False},
+            "assistant_text must be a string",
+        ),
+    ]
+
+    for suffix, payload_updates, expected_message in cases:
+        base_thread = {
+            "thread_id": f"thr_reject_contract_types_{suffix}",
+            "title": "reject",
+            "status": "planned",
+        }
+        payload = {
+            "turn_id": f"agent:selftest:reject-contract-types:{suffix}",
+            "user_text": "类型必须在边界被验证。",
+            "assistant_text": "这是合法回复。",
+            "thread": dict(base_thread),
+        }
+        payload.update(payload_updates)
+        if "thread" in payload_updates:
+            payload["thread"] = {
+                **base_thread,
+                **payload_updates["thread"],
+            }
+
+        error = expect_failure_json(
+            temp_root / f"reject-contract-types-{suffix}",
+            "project-turn",
+            payload=payload,
+        )
+        assert_equal(error["error"]["code"], "TM_INVALID_ARGUMENT", f"{suffix} should map to invalid argument")
+        assert_in(expected_message, error["error"]["message"], f"{suffix} should keep a stable validation message")
+
+
 def test_missing_input_file_is_invalid_argument(temp_root: Path) -> None:
     store_root = temp_root / "missing-input-store"
     missing_path = temp_root / "missing-input.json"
@@ -1160,6 +1237,7 @@ def main() -> int:
         test_source_normalization_and_partial_write_recovery(temp_root)
         test_list_threads_orders_by_absolute_time(temp_root)
         test_context_recorded_at_is_rejected(temp_root)
+        test_project_turn_contract_types_are_rejected(temp_root)
         test_jsonl_read_modes(temp_root)
         test_existing_thread_inbound_only_recovery_preserves_revision(temp_root)
         test_missing_snapshot_recovery_preserves_multiturn_state(temp_root)
