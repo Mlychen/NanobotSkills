@@ -14,6 +14,10 @@ This repository stores local skills for AI coding agents (for example, Codex age
 - Main skill file: `todo-txt/SKILL.md`
 - Timeline memory skill directory: `timeline-memory/`
 - Main skill file: `timeline-memory/SKILL.md`
+- SSH remote Docker ops skill directory: `ssh-remote-docker-ops/`
+- Main skill file: `ssh-remote-docker-ops/SKILL.md`
+- Miniflux HTTP API skill directory: `miniflux-http/`
+- Main skill file: `miniflux-http/SKILL.md`
 
 ## How an Agent Should Use This Repo
 
@@ -25,6 +29,8 @@ This repository stores local skills for AI coding agents (for example, Codex age
 
 - `todo-txt`: Local todo.txt task management workflow (create/query/update/archive tasks).
 - `timeline-memory`: Timeline memory workflow via `project-turn`/`get-thread`/`list-threads` CLI.
+- `ssh-remote-docker-ops`: Remote Docker and Docker Compose operations over SSH, with read-first inspection and service-level management guidance.
+- `miniflux-http`: Miniflux RSS API wrapper with authenticated HTTP operations and E2E testing support.
 
 ## Path Conventions
 
