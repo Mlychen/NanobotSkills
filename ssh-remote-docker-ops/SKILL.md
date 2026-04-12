@@ -53,19 +53,17 @@ ssh <host> "docker image ls"
 ssh <host> "docker compose ls -a"
 ```
 
-3. 查看目标对象细节并提取 compose 关键信息
+3. 查看目标对象细节
 
 ```bash
 ssh <host> "docker logs --tail 200 <container>"
 ssh <host> "docker inspect <container>"
-ssh <host> "docker inspect --format '{{- with .Config.Labels -}}{{- with index . \"com.docker.compose.project\" }}{{ . }}{{ end -}}|{{- with index . \"com.docker.compose.service\" }}{{ . }}{{ end -}}|{{- with index . \"com.docker.compose.project.working_dir\" }}{{ . }}{{ end -}}|{{- with index . \"com.docker.compose.project.config_files\" }}{{ . }}{{ end -}}{{- else -}}|||{{- end -}}' <container>"
 ```
 
+提取 Compose 标签：参见「如何判断是否属于 Compose」一节中的标签提取命令。
+
 4. 判断容器归属后再做变更
-- 如果容器带有 `com.docker.compose.*` 标签，按 compose 服务管理。
-- 优先根据 `com.docker.compose.project.config_files` 恢复原始 `-f ...` 配置文件集合，并结合 `com.docker.compose.project` 恢复 `-p <project>`。
-- 如果存在 `com.docker.compose.project.working_dir`，按需补上 `--project-directory "<working_dir>"`，不要只依赖 `cd <compose_dir>` 丢失原始 Compose 上下文。
-- 只有在无法恢复 `config_files` 时，才退回到进入 `working_dir` 后执行 `docker compose`。
+- 如果容器带有 `com.docker.compose.*` 标签，按 compose 服务管理。参见「如何判断是否属于 Compose」一节提取 project/service/config_files/working_dir 并恢复完整 Compose 上下文。
 - 如果没有 compose 标签，再按独立容器处理。
 
 ## 常用命令模板
@@ -77,7 +75,7 @@ ssh <host> "docker ps -a"
 ssh <host> "docker image ls"
 ssh <host> "docker logs --tail 200 <container>"
 ssh <host> "docker inspect <container>"
-ssh <host> "docker inspect --format '{{- with .Config.Labels -}}{{- with index . \"com.docker.compose.project\" }}{{ . }}{{ end -}}|{{- with index . \"com.docker.compose.service\" }}{{ . }}{{ end -}}|{{- with index . \"com.docker.compose.project.working_dir\" }}{{ . }}{{ end -}}|{{- with index . \"com.docker.compose.project.config_files\" }}{{ . }}{{ end -}}{{- else -}}|||{{- end -}}' <container>"
+# 提取 Compose 标签：参见「如何判断是否属于 Compose」一节
 # 只有在需要判断或管理 compose 项目时再执行
 ssh <host> "docker compose version"
 ssh <host> "docker compose ls -a"
@@ -93,15 +91,7 @@ ssh <host> "docker restart <container>"
 
 ### Compose 服务操作
 
-先通过容器标签确认 `project`、`service`、`config_files`、`working_dir`。优先恢复完整 Compose 上下文，再执行服务级命令。
-
-`<compose_args>` 优先按下面的顺序拼出：
-
-- `-p "<project>"`
-- 由 `com.docker.compose.project.config_files` 还原出的一个或多个 `-f "<file>"`
-- 必要时追加 `--project-directory "<working_dir>"`
-
-只有在无法恢复 `config_files` 时，才退回到 `cd "<compose_dir>" && docker compose ...` / `Set-Location -LiteralPath '<compose_dir>'; docker compose ...` 这种目录切换方式。
+先通过容器标签确认 `project`、`service`、`config_files`、`working_dir`。`<compose_args>` 的拼装规则参见「如何判断是否属于 Compose」一节。
 
 Linux / macOS 远端：
 
@@ -184,7 +174,6 @@ ssh <host> "docker inspect --format '{{- with .Config.Labels -}}{{- with index .
 ## Windows 远端注意事项
 
 - 远端如果是 Windows 主机，优先继续通过 `ssh` 直接执行远端 `docker` 命令，不依赖本机 Docker context
-- 不要默认复用 Linux 风格的 `cd <compose_dir> && docker compose ...` 模板；优先显式传 `-p`、`-f`、`--project-directory` 恢复原始 Compose 上下文
 - 如果本机也是 PowerShell，优先使用外层单引号包裹整个 SSH 远端命令，再在远端 `-Command` 中使用双引号
 - 优先显式调用 `powershell -NoProfile -Command`
 - `compose_dir` 可能包含空格；如果必须切换目录，优先使用 `Set-Location -LiteralPath '<compose_dir>'`
