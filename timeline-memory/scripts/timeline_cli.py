@@ -1305,6 +1305,8 @@ def _is_invalid_argument_message(message: str) -> bool:
         "must be a mapping",
         "must be a JSON object",
         "must be a list",
+        "must be a string",
+        "must be a boolean",
         "must be namespaced",
         "is required",
         "must not be empty",

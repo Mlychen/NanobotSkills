@@ -21,6 +21,28 @@ def ensure_allowed_keys(data: dict[str, Any], allowed: set[str], name: str) -> d
     return data
 
 
+def require_string(value: Any, name: str) -> str:
+    if value is None:
+        raise ValueError(f"{name} is required")
+    if not isinstance(value, str):
+        raise ValueError(f"{name} must be a string")
+    return value
+
+
+def require_optional_string(value: Any, name: str) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValueError(f"{name} must be a string")
+    return value
+
+
+def require_bool(value: Any, name: str) -> bool:
+    if not isinstance(value, bool):
+        raise ValueError(f"{name} must be a boolean")
+    return value
+
+
 def ensure_no_standardized_time_fields(payload: Any) -> None:
     if isinstance(payload, dict):
         for key, value in payload.items():
@@ -321,11 +343,19 @@ class ProjectTurnPlanTime:
             "rrule",
         }, "thread.plan_time")
         return cls(
-            planned_start=str(payload["planned_start"]) if payload.get("planned_start") is not None else None,
-            planned_end=str(payload["planned_end"]) if payload.get("planned_end") is not None else None,
-            due_at=str(payload["due_at"]) if payload.get("due_at") is not None else None,
-            all_day=bool(payload.get("all_day", False)),
-            rrule=str(payload["rrule"]) if payload.get("rrule") is not None else None,
+            planned_start=require_optional_string(payload["planned_start"], "thread.plan_time.planned_start")
+            if "planned_start" in payload
+            else None,
+            planned_end=require_optional_string(payload["planned_end"], "thread.plan_time.planned_end")
+            if "planned_end" in payload
+            else None,
+            due_at=require_optional_string(payload["due_at"], "thread.plan_time.due_at")
+            if "due_at" in payload
+            else None,
+            all_day=require_bool(payload["all_day"], "thread.plan_time.all_day") if "all_day" in payload else False,
+            rrule=require_optional_string(payload["rrule"], "thread.plan_time.rrule")
+            if "rrule" in payload
+            else None,
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -344,8 +374,12 @@ class ProjectTurnFactTime:
             "completed_at",
         }, "thread.fact_time")
         return cls(
-            occurred_at=str(payload["occurred_at"]) if payload.get("occurred_at") is not None else None,
-            completed_at=str(payload["completed_at"]) if payload.get("completed_at") is not None else None,
+            occurred_at=require_optional_string(payload["occurred_at"], "thread.fact_time.occurred_at")
+            if "occurred_at" in payload
+            else None,
+            completed_at=require_optional_string(payload["completed_at"], "thread.fact_time.completed_at")
+            if "completed_at" in payload
+            else None,
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -368,8 +402,10 @@ class ProjectTurnContent:
             "items",
         }, "thread.content")
         return cls(
-            notes=str(payload.get("notes", "")),
-            outcome=str(payload["outcome"]) if payload.get("outcome") is not None else None,
+            notes=require_string(payload["notes"], "thread.content.notes") if "notes" in payload else "",
+            outcome=require_optional_string(payload["outcome"], "thread.content.outcome")
+            if "outcome" in payload
+            else None,
             followups=normalize_structured_list(payload.get("followups", []), field_name="thread.content.followups"),
             items=normalize_structured_list(payload.get("items", []), field_name="thread.content.items"),
         )
@@ -410,10 +446,10 @@ class ProjectTurnThreadInput:
             "content",
         }, "thread")
         return cls(
-            thread_id=str(payload["thread_id"]) if payload.get("thread_id") is not None else None,
-            thread_kind=str(payload.get("thread_kind", "task")),
-            title=str(payload["title"]),
-            status=str(payload["status"]),
+            thread_id=require_optional_string(payload["thread_id"], "thread.thread_id") if "thread_id" in payload else None,
+            thread_kind=require_string(payload["thread_kind"], "thread.thread_kind") if "thread_kind" in payload else "task",
+            title=require_string(payload["title"], "thread.title"),
+            status=require_string(payload["status"], "thread.status"),
             plan_time=ProjectTurnPlanTime.from_dict(payload.get("plan_time")),
             fact_time=ProjectTurnFactTime.from_dict(payload.get("fact_time")),
             content=ProjectTurnContent.from_dict(payload.get("content")),
@@ -445,11 +481,13 @@ class ProjectTurnContext:
             "assistant_actor_id",
         }, "context")
         return cls(
-            source=str(payload.get("source", "skill://timeline-memory")),
-            actor_id=str(payload["actor_id"]) if payload.get("actor_id") is not None else None,
-            assistant_actor_id=(
-                str(payload["assistant_actor_id"]) if payload.get("assistant_actor_id") is not None else None
-            ),
+            source=require_string(payload["source"], "context.source")
+            if "source" in payload
+            else "skill://timeline-memory",
+            actor_id=require_optional_string(payload["actor_id"], "context.actor_id") if "actor_id" in payload else None,
+            assistant_actor_id=require_optional_string(payload["assistant_actor_id"], "context.assistant_actor_id")
+            if "assistant_actor_id" in payload
+            else None,
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -482,9 +520,11 @@ class ProjectTurnInput:
             "context",
         }, "project-turn input")
         return cls(
-            turn_id=str(payload["turn_id"]),
-            user_text=str(payload["user_text"]),
-            assistant_text=str(payload["assistant_text"]) if payload.get("assistant_text") is not None else None,
+            turn_id=require_string(payload["turn_id"], "turn_id"),
+            user_text=require_string(payload["user_text"], "user_text"),
+            assistant_text=require_optional_string(payload["assistant_text"], "assistant_text")
+            if "assistant_text" in payload
+            else None,
             thread=ProjectTurnThreadInput.from_dict(payload.get("thread")),
             context=ProjectTurnContext.from_dict(payload.get("context")),
         )
