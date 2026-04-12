@@ -1,0 +1,4 @@
+interface:
+  display_name: "Miniflux HTTP"
+  short_description: "Operate Miniflux over authenticated HTTP"
+  default_prompt: "Use $miniflux-http to inspect feeds, entries, and categories or perform Miniflux admin actions over HTTP."
