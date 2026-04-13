@@ -5,3 +5,4 @@ timeline-store/
 tmp/
 .pytest_cache/
 pytest-cache-files-*/
+_artifacts/
