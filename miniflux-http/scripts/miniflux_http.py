@@ -69,11 +69,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    for name in ("request", "show-config"):
+    for name in ("request", "show-config", "mark-read"):
         subparser = subparsers.add_parser(name)
         add_common_arguments(subparser)
         if name == "request":
             add_request_arguments(subparser)
+        elif name == "mark-read":
+            add_mark_read_arguments(subparser)
 
     return parser
 
@@ -113,6 +115,31 @@ def add_request_arguments(parser: argparse.ArgumentParser) -> None:
         action="store_true",
         help="Only output entry titles and metadata, strip body content.",
     )
+
+
+def add_mark_read_arguments(parser: argparse.ArgumentParser) -> None:
+    scope_group = parser.add_mutually_exclusive_group(required=True)
+    scope_group.add_argument(
+        "--all",
+        action="store_true",
+        help="Mark all unread entries for the authenticated user as read.",
+    )
+    scope_group.add_argument(
+        "--category-id",
+        type=int,
+        help="Mark all unread entries in the given category as read.",
+    )
+    scope_group.add_argument(
+        "--category",
+        help="Mark all unread entries in the named category as read.",
+    )
+    parser.add_argument(
+        "--user-id",
+        type=int,
+        help="Override the Miniflux user ID instead of resolving it from /v1/me.",
+    )
+    parser.add_argument("--include-status", action="store_true")
+    parser.add_argument("--dry-run", action="store_true")
 
 
 def inspect_config(args: argparse.Namespace) -> dict[str, object]:
@@ -228,6 +255,143 @@ def redact_headers(headers: dict[str, str]) -> dict[str, str]:
     return redacted
 
 
+def preview_request(method: str, url: str, headers: dict[str, str], body: bytes | None) -> int:
+    preview = {
+        "method": method.upper(),
+        "url": url,
+        "headers": redact_headers(headers),
+        "has_body": body is not None,
+    }
+    print(json.dumps(preview, indent=2, ensure_ascii=True))
+    if body is not None:
+        write_text(sys.stdout, body.decode("utf-8", errors="replace"))
+        if not body.endswith(b"\n"):
+            write_text(sys.stdout, "\n")
+    return 0
+
+
+def execute_request(
+    *,
+    url: str,
+    method: str,
+    headers: dict[str, str],
+    body: bytes | None,
+    timeout: float,
+    raw: bool = False,
+    include_status: bool = False,
+    dry_run: bool = False,
+    title_only: bool = False,
+) -> int:
+    if dry_run:
+        return preview_request(method, url, headers, body)
+
+    request = Request(
+        url=url,
+        data=body,
+        headers=headers,
+        method=method.upper(),
+    )
+
+    try:
+        with urlopen(request, timeout=timeout) as response:
+            return render_response(
+                response.read(),
+                raw=raw,
+                include_status=include_status,
+                status=response.status,
+                title_only=title_only,
+            )
+    except HTTPError as exc:
+        error_body = exc.read()
+        status_line = f"HTTP {exc.code}"
+        if exc.reason:
+            status_line = f"{status_line} {exc.reason}"
+        write_text(sys.stderr, f"{status_line}\n")
+        if error_body:
+            write_text(sys.stderr, error_body.decode("utf-8", errors="replace"))
+        else:
+            write_text(sys.stderr, "Request failed with an empty error response.\n")
+        if error_body and not error_body.endswith(b"\n"):
+            write_text(sys.stderr, "\n")
+        return 1
+    except URLError as exc:
+        write_text(sys.stderr, f"Request failed: {exc}\n")
+        return 1
+
+
+def resolve_current_user_id(
+    config: dict[str, object], headers: dict[str, str], timeout: float
+) -> int:
+    url = build_url(str(config["base_url"]), "/v1/me", [])
+    request = Request(
+        url=url,
+        headers=headers,
+        method="GET",
+    )
+    try:
+        with urlopen(request, timeout=timeout) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except HTTPError as exc:
+        raise CliUsageError(f"Unable to resolve current user from /v1/me: HTTP {exc.code}") from exc
+    except URLError as exc:
+        raise CliUsageError(f"Unable to resolve current user from /v1/me: {exc}") from exc
+    except json.JSONDecodeError as exc:
+        raise CliUsageError("Unable to resolve current user from /v1/me: invalid JSON response") from exc
+
+    user_id = payload.get("id")
+    if not isinstance(user_id, int):
+        raise CliUsageError("Unable to resolve current user from /v1/me: missing integer id")
+    return user_id
+
+
+def resolve_category_id(
+    config: dict[str, object], headers: dict[str, str], timeout: float, category_name: str
+) -> int:
+    url = build_url(str(config["base_url"]), "/v1/categories", [])
+    request = Request(
+        url=url,
+        headers=headers,
+        method="GET",
+    )
+    try:
+        with urlopen(request, timeout=timeout) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except HTTPError as exc:
+        raise CliUsageError(f"Unable to resolve category from /v1/categories: HTTP {exc.code}") from exc
+    except URLError as exc:
+        raise CliUsageError(f"Unable to resolve category from /v1/categories: {exc}") from exc
+    except json.JSONDecodeError as exc:
+        raise CliUsageError("Unable to resolve category from /v1/categories: invalid JSON response") from exc
+
+    if not isinstance(payload, list):
+        raise CliUsageError("Unable to resolve category from /v1/categories: expected category list")
+
+    exact_matches = [
+        item for item in payload
+        if isinstance(item, dict) and item.get("title") == category_name and isinstance(item.get("id"), int)
+    ]
+    if len(exact_matches) == 1:
+        return int(exact_matches[0]["id"])
+    if len(exact_matches) > 1:
+        raise CliUsageError(f"Category name is ambiguous: {category_name}")
+
+    normalized = category_name.casefold()
+    folded_matches = [
+        item for item in payload
+        if (
+            isinstance(item, dict)
+            and isinstance(item.get("title"), str)
+            and item["title"].casefold() == normalized
+            and isinstance(item.get("id"), int)
+        )
+    ]
+    if len(folded_matches) == 1:
+        return int(folded_matches[0]["id"])
+    if len(folded_matches) > 1:
+        raise CliUsageError(f"Category name is ambiguous: {category_name}")
+    raise CliUsageError(f"Category not found: {category_name}")
+
+
 def command_show_config(args: argparse.Namespace) -> int:
     config = inspect_config(args)
     payload = {
@@ -300,52 +464,51 @@ def command_request(args: argparse.Namespace) -> int:
     body = load_body(args, headers)
     url = build_url(str(config["base_url"]), args.path, args.query)
 
-    if args.dry_run:
-        preview = {
-            "method": args.method.upper(),
-            "url": url,
-            "headers": redact_headers(headers),
-            "has_body": body is not None,
-        }
-        print(json.dumps(preview, indent=2, ensure_ascii=True))
-        if body is not None:
-            write_text(sys.stdout, body.decode("utf-8", errors="replace"))
-            if not body.endswith(b"\n"):
-                write_text(sys.stdout, "\n")
-        return 0
-
-    request = Request(
+    return execute_request(
         url=url,
-        data=body,
         headers=headers,
-        method=args.method.upper(),
+        body=body,
+        method=args.method,
+        timeout=args.timeout,
+        raw=args.raw,
+        include_status=args.include_status,
+        dry_run=args.dry_run,
+        title_only=args.title_only,
     )
 
-    try:
-        with urlopen(request, timeout=args.timeout) as response:
-            return render_response(
-                response.read(),
-                raw=args.raw,
-                include_status=args.include_status,
-                status=response.status,
-                title_only=args.title_only,
-            )
-    except HTTPError as exc:
-        error_body = exc.read()
-        status_line = f"HTTP {exc.code}"
-        if exc.reason:
-            status_line = f"{status_line} {exc.reason}"
-        write_text(sys.stderr, f"{status_line}\n")
-        if error_body:
-            write_text(sys.stderr, error_body.decode("utf-8", errors="replace"))
-        else:
-            write_text(sys.stderr, "Request failed with an empty error response.\n")
-        if error_body and not error_body.endswith(b"\n"):
-            write_text(sys.stderr, "\n")
-        return 1
-    except URLError as exc:
-        write_text(sys.stderr, f"Request failed: {exc}\n")
-        return 1
+
+def command_mark_read(args: argparse.Namespace) -> int:
+    config = resolve_request_config(args)
+    headers = build_headers(config, [])
+    if args.category_id is not None:
+        url = build_url(
+            str(config["base_url"]),
+            f"/v1/categories/{args.category_id}/mark-all-as-read",
+            [],
+        )
+    elif args.category is not None:
+        category_id = resolve_category_id(config, headers, args.timeout, args.category)
+        url = build_url(
+            str(config["base_url"]),
+            f"/v1/categories/{category_id}/mark-all-as-read",
+            [],
+        )
+    else:
+        user_id = args.user_id if args.user_id is not None else resolve_current_user_id(
+            config, headers, args.timeout
+        )
+        url = build_url(
+            str(config["base_url"]), f"/v1/users/{user_id}/mark-all-as-read", []
+        )
+    return execute_request(
+        url=url,
+        method="PUT",
+        headers=headers,
+        body=None,
+        timeout=args.timeout,
+        include_status=args.include_status,
+        dry_run=args.dry_run,
+    )
 
 
 def main() -> int:
@@ -357,6 +520,8 @@ def main() -> int:
             return command_show_config(args)
         if args.command == "request":
             return command_request(args)
+        if args.command == "mark-read":
+            return command_mark_read(args)
 
         parser.error(f"Unknown command: {args.command}")
         return 2

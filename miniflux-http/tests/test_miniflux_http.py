@@ -68,6 +68,9 @@ class MinifluxHttpCliTests(unittest.TestCase):
             cli_env.pop(key, None)
         if env:
             cli_env.update(env)
+        temp_home = str(ROOT / "_test_home")
+        cli_env["HOME"] = temp_home
+        cli_env["USERPROFILE"] = temp_home
         return subprocess.run(
             [sys.executable, str(SCRIPT), *args],
             text=True,
@@ -177,6 +180,18 @@ class MinifluxHttpCliTests(unittest.TestCase):
         self.assertEqual(result.returncode, 2)
         self.assertIn("Body file not found: missing.json", result.stderr)
         self.assertNotIn("Traceback", result.stderr)
+
+    def test_mark_read_without_scope_returns_usage_error(self) -> None:
+        result = self.run_cli(
+            "mark-read",
+            "--base-url",
+            "http://example.test",
+            "--api-key",
+            "secret",
+        )
+
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("one of the arguments --all --category-id --category is required", result.stderr)
 
 
 class MinifluxHttpRequestErrorTests(unittest.TestCase):
@@ -368,6 +383,197 @@ class MinifluxHttpRequestSuccessTests(unittest.TestCase):
         code, stdout = self.run_request_with_response(args, body)
         self.assertEqual(code, 0)
         self.assertIn("HTTP 200", stdout)
+
+
+class MinifluxHttpMarkReadTests(unittest.TestCase):
+    def make_args(
+        self,
+        *,
+        all_entries: bool = True,
+        category_id: int | None = None,
+        category: str | None = None,
+        user_id: int | None = None,
+        dry_run: bool = False,
+        include_status: bool = False,
+    ) -> argparse.Namespace:
+        return argparse.Namespace(
+            base_url="http://example.test",
+            api_key="secret",
+            username=None,
+            password=None,
+            timeout=30.0,
+            all=all_entries,
+            category_id=category_id,
+            category=category,
+            user_id=user_id,
+            include_status=include_status,
+            dry_run=dry_run,
+            command="mark-read",
+        )
+
+    def test_mark_read_all_dry_run_uses_explicit_user_id(self) -> None:
+        stdout = StringIO()
+        args = self.make_args(user_id=9, dry_run=True)
+
+        with patch.object(sys, "stdout", stdout):
+            code = MODULE.command_mark_read(args)
+
+        self.assertEqual(code, 0)
+        payload = json.loads(stdout.getvalue())
+        self.assertEqual(payload["method"], "PUT")
+        self.assertEqual(
+            payload["url"], "http://example.test/v1/users/9/mark-all-as-read"
+        )
+        self.assertFalse(payload["has_body"])
+
+    def test_mark_read_category_dry_run_targets_category_route(self) -> None:
+        stdout = StringIO()
+        args = self.make_args(all_entries=False, category_id=12, dry_run=True)
+
+        with patch.object(sys, "stdout", stdout):
+            code = MODULE.command_mark_read(args)
+
+        self.assertEqual(code, 0)
+        payload = json.loads(stdout.getvalue())
+        self.assertEqual(payload["method"], "PUT")
+        self.assertEqual(
+            payload["url"], "http://example.test/v1/categories/12/mark-all-as-read"
+        )
+        self.assertFalse(payload["has_body"])
+
+    def test_mark_read_category_name_dry_run_resolves_category_id(self) -> None:
+        stdout = StringIO()
+        args = self.make_args(all_entries=False, category="Tech", dry_run=True)
+        categories_response = DummyHTTPResponse(
+            json.dumps(
+                [
+                    {"id": 12, "title": "Tech"},
+                    {"id": 15, "title": "News"},
+                ]
+            ).encode()
+        )
+        requests: list[object] = []
+
+        def fake_urlopen(request, timeout):  # noqa: ANN001
+            requests.append(request)
+            return categories_response
+
+        with patch.object(MODULE, "urlopen", side_effect=fake_urlopen):
+            with patch.object(sys, "stdout", stdout):
+                code = MODULE.command_mark_read(args)
+
+        self.assertEqual(code, 0)
+        self.assertEqual(len(requests), 1)
+        self.assertEqual(requests[0].full_url, "http://example.test/v1/categories")
+        payload = json.loads(stdout.getvalue())
+        self.assertEqual(payload["method"], "PUT")
+        self.assertEqual(
+            payload["url"], "http://example.test/v1/categories/12/mark-all-as-read"
+        )
+        self.assertFalse(payload["has_body"])
+
+    def test_mark_read_all_resolves_user_from_me(self) -> None:
+        args = self.make_args()
+        me_response = DummyHTTPResponse(b'{"id": 7, "username": "admin"}')
+        mark_response = DummyHTTPResponse(b"")
+        requests: list[object] = []
+
+        def fake_urlopen(request, timeout):  # noqa: ANN001
+            requests.append(request)
+            if len(requests) == 1:
+                return me_response
+            return mark_response
+
+        with patch.object(MODULE, "urlopen", side_effect=fake_urlopen):
+            code = MODULE.command_mark_read(args)
+
+        self.assertEqual(code, 0)
+        self.assertEqual(len(requests), 2)
+        self.assertEqual(requests[0].full_url, "http://example.test/v1/me")
+        self.assertEqual(requests[0].method, "GET")
+        self.assertEqual(
+            requests[1].full_url,
+            "http://example.test/v1/users/7/mark-all-as-read",
+        )
+        self.assertEqual(requests[1].method, "PUT")
+
+    def test_mark_read_category_does_not_resolve_user(self) -> None:
+        args = self.make_args(all_entries=False, category_id=12)
+        category_response = DummyHTTPResponse(b"")
+        requests: list[object] = []
+
+        def fake_urlopen(request, timeout):  # noqa: ANN001
+            requests.append(request)
+            return category_response
+
+        with patch.object(MODULE, "urlopen", side_effect=fake_urlopen):
+            code = MODULE.command_mark_read(args)
+
+        self.assertEqual(code, 0)
+        self.assertEqual(len(requests), 1)
+        self.assertEqual(
+            requests[0].full_url,
+            "http://example.test/v1/categories/12/mark-all-as-read",
+        )
+        self.assertEqual(requests[0].method, "PUT")
+
+    def test_mark_read_category_name_is_case_insensitive(self) -> None:
+        args = self.make_args(all_entries=False, category="tech")
+        categories_response = DummyHTTPResponse(
+            json.dumps(
+                [
+                    {"id": 12, "title": "Tech"},
+                    {"id": 15, "title": "News"},
+                ]
+            ).encode()
+        )
+        category_response = DummyHTTPResponse(b"")
+        requests: list[object] = []
+
+        def fake_urlopen(request, timeout):  # noqa: ANN001
+            requests.append(request)
+            if len(requests) == 1:
+                return categories_response
+            return category_response
+
+        with patch.object(MODULE, "urlopen", side_effect=fake_urlopen):
+            code = MODULE.command_mark_read(args)
+
+        self.assertEqual(code, 0)
+        self.assertEqual(len(requests), 2)
+        self.assertEqual(requests[0].full_url, "http://example.test/v1/categories")
+        self.assertEqual(
+            requests[1].full_url,
+            "http://example.test/v1/categories/12/mark-all-as-read",
+        )
+        self.assertEqual(requests[1].method, "PUT")
+
+    def test_mark_read_resolve_user_requires_integer_id(self) -> None:
+        args = self.make_args()
+
+        with patch.object(MODULE, "urlopen", return_value=DummyHTTPResponse(b'{"username": "admin"}')):
+            with self.assertRaises(MODULE.CliUsageError):
+                MODULE.command_mark_read(args)
+
+    def test_mark_read_category_name_requires_match(self) -> None:
+        args = self.make_args(all_entries=False, category="Missing")
+
+        with patch.object(MODULE, "urlopen", return_value=DummyHTTPResponse(b'[]')):
+            with self.assertRaisesRegex(MODULE.CliUsageError, "Category not found: Missing"):
+                MODULE.command_mark_read(args)
+
+    def test_mark_read_category_name_rejects_ambiguous_match(self) -> None:
+        args = self.make_args(all_entries=False, category="tech")
+        body = json.dumps(
+            [
+                {"id": 12, "title": "Tech"},
+                {"id": 13, "title": "TECH"},
+            ]
+        ).encode()
+
+        with patch.object(MODULE, "urlopen", return_value=DummyHTTPResponse(body)):
+            with self.assertRaisesRegex(MODULE.CliUsageError, "Category name is ambiguous: tech"):
+                MODULE.command_mark_read(args)
 
 
 if __name__ == "__main__":

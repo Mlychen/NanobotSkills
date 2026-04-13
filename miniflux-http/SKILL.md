@@ -15,6 +15,10 @@ Use this skill when the work should be expressed as stable Miniflux commands ins
 - Prefer API key authentication. Fall back to basic auth only when API key auth is unavailable.
 - Start every session with a read-only handshake: run `python scripts/miniflux_http.py show-config`, then verify `/healthcheck`, then resolve `/v1/version` and `/v1/me` before mutating state.
 - `show-config` is diagnostic: it always prints JSON, returns `0` when the configuration is request-ready, and returns `1` when required inputs are still missing.
+- Use `python scripts/miniflux_http.py mark-read --all` to mark every unread entry for the current user as read in one step.
+- Use `python scripts/miniflux_http.py mark-read --category-id 123` to mark all unread entries in a category as read.
+- Use `python scripts/miniflux_http.py mark-read --category "Tech"` to resolve a category by name first, then mark that category as read.
+- Add `--dry-run` to preview the resolved route first.
 - Use [references/command-surface.md](references/command-surface.md) for the canonical command set.
 - Use [references/repo-alignment.md](references/repo-alignment.md) for auth conventions, stable naming, and authoring-time HTTP notes.
 - Use [scripts/miniflux_http.py](scripts/miniflux_http.py) for authenticated one-off requests or request previews instead of rewriting auth code.
