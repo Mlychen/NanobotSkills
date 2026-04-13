@@ -10,6 +10,7 @@ from io import StringIO
 from pathlib import Path
 from unittest.mock import patch
 from urllib.error import HTTPError
+from urllib.error import URLError
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -552,7 +553,7 @@ class MinifluxHttpMarkReadTests(unittest.TestCase):
         args = self.make_args()
 
         with patch.object(MODULE, "urlopen", return_value=DummyHTTPResponse(b'{"username": "admin"}')):
-            with self.assertRaises(MODULE.CliUsageError):
+            with self.assertRaises(MODULE.RequestFailureError):
                 MODULE.command_mark_read(args)
 
     def test_mark_read_category_name_requires_match(self) -> None:
@@ -574,6 +575,54 @@ class MinifluxHttpMarkReadTests(unittest.TestCase):
         with patch.object(MODULE, "urlopen", return_value=DummyHTTPResponse(body)):
             with self.assertRaisesRegex(MODULE.CliUsageError, "Category name is ambiguous: tech"):
                 MODULE.command_mark_read(args)
+
+    def test_main_mark_read_all_lookup_network_failure_returns_request_error_exit_code(self) -> None:
+        stderr = StringIO()
+        argv = [
+            str(SCRIPT),
+            "mark-read",
+            "--base-url",
+            "http://example.test",
+            "--api-key",
+            "secret",
+            "--all",
+        ]
+
+        with patch.object(sys, "argv", argv):
+            with patch.object(MODULE, "urlopen", side_effect=URLError("connection refused")):
+                with patch.object(sys, "stderr", stderr):
+                    code = MODULE.main()
+
+        self.assertEqual(code, 1)
+        self.assertIn("Unable to resolve current user from /v1/me", stderr.getvalue())
+
+    def test_main_mark_read_category_lookup_http_failure_returns_request_error_exit_code(self) -> None:
+        stderr = StringIO()
+        argv = [
+            str(SCRIPT),
+            "mark-read",
+            "--base-url",
+            "http://example.test",
+            "--api-key",
+            "secret",
+            "--category",
+            "Tech",
+        ]
+        error = HTTPError(
+            url="http://example.test/v1/categories",
+            code=500,
+            msg="Internal Server Error",
+            hdrs=None,
+            fp=DummyHTTPResponse(b""),
+        )
+
+        with patch.object(sys, "argv", argv):
+            with patch.object(MODULE, "urlopen", side_effect=error):
+                with patch.object(sys, "stderr", stderr):
+                    code = MODULE.main()
+
+        self.assertEqual(code, 1)
+        self.assertIn("Unable to resolve category from /v1/categories: HTTP 500", stderr.getvalue())
 
 
 if __name__ == "__main__":

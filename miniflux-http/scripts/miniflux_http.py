@@ -41,6 +41,10 @@ class CliUsageError(Exception):
     """Raised when the user provides invalid CLI input."""
 
 
+class RequestFailureError(Exception):
+    """Raised when a runtime HTTP lookup fails."""
+
+
 def write_text(stream: object, text: str) -> None:
     try:
         stream.write(text)
@@ -332,15 +336,23 @@ def resolve_current_user_id(
         with urlopen(request, timeout=timeout) as response:
             payload = json.loads(response.read().decode("utf-8"))
     except HTTPError as exc:
-        raise CliUsageError(f"Unable to resolve current user from /v1/me: HTTP {exc.code}") from exc
+        raise RequestFailureError(
+            f"Unable to resolve current user from /v1/me: HTTP {exc.code}"
+        ) from exc
     except URLError as exc:
-        raise CliUsageError(f"Unable to resolve current user from /v1/me: {exc}") from exc
+        raise RequestFailureError(
+            f"Unable to resolve current user from /v1/me: {exc}"
+        ) from exc
     except json.JSONDecodeError as exc:
-        raise CliUsageError("Unable to resolve current user from /v1/me: invalid JSON response") from exc
+        raise RequestFailureError(
+            "Unable to resolve current user from /v1/me: invalid JSON response"
+        ) from exc
 
     user_id = payload.get("id")
     if not isinstance(user_id, int):
-        raise CliUsageError("Unable to resolve current user from /v1/me: missing integer id")
+        raise RequestFailureError(
+            "Unable to resolve current user from /v1/me: missing integer id"
+        )
     return user_id
 
 
@@ -357,14 +369,22 @@ def resolve_category_id(
         with urlopen(request, timeout=timeout) as response:
             payload = json.loads(response.read().decode("utf-8"))
     except HTTPError as exc:
-        raise CliUsageError(f"Unable to resolve category from /v1/categories: HTTP {exc.code}") from exc
+        raise RequestFailureError(
+            f"Unable to resolve category from /v1/categories: HTTP {exc.code}"
+        ) from exc
     except URLError as exc:
-        raise CliUsageError(f"Unable to resolve category from /v1/categories: {exc}") from exc
+        raise RequestFailureError(
+            f"Unable to resolve category from /v1/categories: {exc}"
+        ) from exc
     except json.JSONDecodeError as exc:
-        raise CliUsageError("Unable to resolve category from /v1/categories: invalid JSON response") from exc
+        raise RequestFailureError(
+            "Unable to resolve category from /v1/categories: invalid JSON response"
+        ) from exc
 
     if not isinstance(payload, list):
-        raise CliUsageError("Unable to resolve category from /v1/categories: expected category list")
+        raise RequestFailureError(
+            "Unable to resolve category from /v1/categories: expected category list"
+        )
 
     exact_matches = [
         item for item in payload
@@ -528,6 +548,9 @@ def main() -> int:
     except CliUsageError as exc:
         write_text(sys.stderr, f"{exc}\n")
         return 2
+    except RequestFailureError as exc:
+        write_text(sys.stderr, f"{exc}\n")
+        return 1
 
 
 if __name__ == "__main__":
