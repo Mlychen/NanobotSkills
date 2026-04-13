@@ -11,11 +11,7 @@ import pytest
 
 
 ALLOWED_COMMANDS = {"project-turn", "get-thread", "list-threads", "list-thread-history"}
-SCRIPT_DIR = Path(__file__).resolve().parents[2] / "scripts"
-if str(SCRIPT_DIR) not in sys.path:
-    sys.path.insert(0, str(SCRIPT_DIR))
-
-from store import acquire_project_turn_write_lock
+from scripts.store import acquire_project_turn_write_lock
 
 
 def resolve_python_command() -> list[str]:

@@ -13,7 +13,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from errors import (
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from scripts.errors import (
     TimelineInvalidArgumentError,
     TimelineMetadataConflictError,
     TimelinePartialWriteError,
@@ -21,11 +25,7 @@ from errors import (
     TimelineStructuredError,
     TimelineTurnConflictError,
 )
-SCRIPT_DIR = Path(__file__).resolve().parent
-if str(SCRIPT_DIR) not in sys.path:
-    sys.path.insert(0, str(SCRIPT_DIR))
-
-from models import (  # noqa: E402
+from scripts.models import (  # noqa: E402
     ProjectTurnInput,
     RawEventRecord,
     ThreadContent,
@@ -35,7 +35,7 @@ from models import (  # noqa: E402
     ThreadPlanTime,
     ThreadRecord,
 )
-from store import (  # noqa: E402
+from scripts.store import (  # noqa: E402
     DEFAULT_JSONL_READ_MODE,
     PROJECT_TURN_TXN_STAGE_ORDER,
     StoreWriteBusyError,
@@ -43,7 +43,7 @@ from store import (  # noqa: E402
     VALID_JSONL_READ_MODES,
     thread_listing_sort_key,
 )
-from time_utils import parse_optional_timestamp  # noqa: E402
+from scripts.time_utils import parse_optional_timestamp  # noqa: E402
 logging.basicConfig(level=logging.WARNING)
 
 TIMELINE_META_KEY = "_timeline_memory"

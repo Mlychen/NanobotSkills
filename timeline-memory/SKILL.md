@@ -47,6 +47,7 @@ uv run python scripts/timeline_cli.py list-thread-history --store-root /path/to/
 - 自带 `pyproject.toml`
 - 自带 `.gitignore`
 - 自带 `scripts/selftest.py`
+- 仓库内部实现统一使用 `scripts.*` 命名空间；对外仍只承诺脚本式 CLI 入口，不承诺稳定的 Python 库导入接口
 
 把整个 `timeline-memory/` 目录复制到别处后，直接在该目录内运行：
 

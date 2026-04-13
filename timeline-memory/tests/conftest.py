@@ -16,17 +16,16 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 CLI_PATH = REPO_ROOT / "scripts" / "timeline_cli.py"
-SCRIPTS_DIR = REPO_ROOT / "scripts"
 DEFAULT_TEST_MODE = "sandbox-safe"
 VALID_TEST_MODES = {"sandbox-safe", "standard"}
 TEST_TMP_ENV_VAR = "TIMELINE_TEST_TMP_ROOT"
 
-if str(SCRIPTS_DIR) not in sys.path:
-    sys.path.insert(0, str(SCRIPTS_DIR))
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
-import timeline_cli
-from test_runtime import build_test_env
-from test_runtime import resolve_tmp_root
+from scripts import timeline_cli
+from scripts.test_runtime import build_test_env
+from scripts.test_runtime import resolve_tmp_root
 
 DEFAULT_TEST_TMP_ROOT = resolve_tmp_root(
     REPO_ROOT,

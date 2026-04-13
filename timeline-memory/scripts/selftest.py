@@ -7,11 +7,14 @@ import subprocess
 import sys
 from pathlib import Path
 
-from models import ProjectTurnInput, RawEventRecord
-from store import encode_thread_storage_key
-
-
 ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from scripts.models import ProjectTurnInput, RawEventRecord
+from scripts.store import encode_thread_storage_key
+
+
 CLI = ROOT / "scripts" / "timeline_cli.py"
 DEFAULT_SOURCE = "skill://timeline-memory"
 TIMELINE_META_KEY = "_timeline_memory"

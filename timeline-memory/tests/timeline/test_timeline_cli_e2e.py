@@ -11,8 +11,8 @@ from pathlib import Path
 
 import pytest
 
-from models import ProjectTurnInput
-from timeline_cli import build_raw_event, resolve_effective_source, resolve_thread_id
+from scripts.models import ProjectTurnInput
+from scripts.timeline_cli import build_raw_event, resolve_effective_source, resolve_thread_id
 
 
 def _raw_event_lines(store_root: Path) -> list[str]:

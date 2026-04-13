@@ -7,18 +7,14 @@ import pytest
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-SCRIPTS_DIR = REPO_ROOT / "scripts"
-if str(SCRIPTS_DIR) not in sys.path:
-    sys.path.insert(0, str(SCRIPTS_DIR))
-
-from errors import (  # noqa: E402
+from scripts.errors import (
     TimelineInvalidArgumentError,
     TimelineMetadataConflictError,
     TimelinePartialWriteError,
     TimelineReadFailedError,
     TimelineTurnConflictError,
 )
-from timeline_cli import classify_cli_error  # noqa: E402
+from scripts.timeline_cli import classify_cli_error
 
 
 @pytest.mark.parametrize(

@@ -8,11 +8,14 @@ import sys
 import importlib.util
 from pathlib import Path
 
-from test_runtime import build_test_env
-from test_runtime import resolve_tmp_root
-
-
 ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from scripts.test_runtime import build_test_env
+from scripts.test_runtime import resolve_tmp_root
+
+
 DEFAULT_MODE = "sandbox-safe"
 VALID_MODES = {"sandbox-safe", "standard"}
 TEST_TMP_ENV_VAR = "TIMELINE_TEST_TMP_ROOT"

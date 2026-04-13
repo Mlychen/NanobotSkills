@@ -9,7 +9,8 @@
 ## 风险结论
 
 - 风险是否真实：`是`
-- 紧急度：`中低`
+- 当前状态：`主路径已缓解`
+- 紧急度：`低`
 - 影响面：`低到中` 对 CLI 用户，`中到高` 对开发和复用
 
 ## 背景
@@ -24,16 +25,27 @@
 
 ## 证据
 
-### 路径补丁入口
+### 历史风险入口
 
-- [../../scripts/timeline_cli.py](../../scripts/timeline_cli.py) 启动时会手工把 `scripts/` 塞进 `sys.path`
-- [../../scripts/store.py](../../scripts/store.py) 仍用顶层 `from models import ...`
+- 旧实现里，[../../scripts/timeline_cli.py](../../scripts/timeline_cli.py) 会把 `scripts/` 塞进 `sys.path`
+- 旧实现里，[../../scripts/store.py](../../scripts/store.py) 与测试代码依赖顶层 `from models import ...`、`from store import ...`
 
-### 已确认的脆弱场景
+### 当前缓解状态
 
-- 直接 `from scripts.store import TimelineStore` 会失败，因为 `models` 不是标准包内相对导入。
-- 在先导入 `scripts.timeline_cli` 后，再导入 `store` 和 `scripts.store`，会出现双模块身份问题。
-- 测试本身已经依赖类似的路径注入技巧。
+- 当前仓库内部导入已统一收敛为 `scripts.*` 命名空间
+- 直接运行脚本入口已统一改为“只补 repo root，再走 `scripts.*` 导入”
+- 已增加 import-path 回归，防止顶层 `store/models/errors/timeline_cli` 再次混入同一进程
+
+### 历史脆弱场景
+
+- 历史上，直接 `from scripts.store import TimelineStore` 会失败，因为内部仍依赖顶层裸导入。
+- 历史上，在先导入 `scripts.timeline_cli` 后，再导入 `store` 和 `scripts.store`，会出现双模块身份问题。
+- 历史上，测试本身也依赖类似的路径注入技巧。
+
+### 剩余边界
+
+- 当前仍只对脚本式 CLI 入口提供稳定公开合同，不把 `scripts.*` 视为对外稳定库 API。
+- 若后续重新引入顶层裸导入或把 `scripts/` 自身塞回 `sys.path`，该风险会复发。
 
 ## 为什么这是风险
 
@@ -77,7 +89,7 @@
 
 但如果后续明确要把内部模块当库来复用，这一项优先级应立即上调。
 
-## 建议推进方向
+## 当前处理方案
 
 ### 修复目标
 
@@ -88,13 +100,16 @@
 
 ### 建议步骤
 
-1. 如果只支持 CLI bundle，就尽量减少内部导入暴露，文档明确“不保证包式复用”。
-2. 如果支持包式导入，就改成一致的包内导入方式。
-3. 测试导入方式与生产推荐方式保持一致。
+1. 保持对外公开合同仍为脚本式 CLI bundle。
+2. 仓库内部统一使用 `scripts.*` 包路径导入。
+3. 测试导入方式与生产内部导入方式保持一致。
+4. 通过专项回归阻止裸模块重新进入代码库。
 
 ## 验收建议
 
-至少满足以下之一：
+至少满足以下条件：
 
-- 方案 A：所有内部模块都能稳定通过包路径导入。
-- 方案 B：明确限制只支持 CLI，测试和脚本不再依赖易混淆的双模块导入方式。
+- 所有内部模块都稳定通过 `scripts.*` 包路径导入。
+- 公开 CLI 入口继续支持 `python scripts/<tool>.py ...` 直接运行。
+- 导入 `scripts.timeline_cli` 后，同一进程中不存在顶层 `store/models/errors/timeline_cli` 裸模块。
+- 仓库测试持续拒绝新增顶层裸导入。

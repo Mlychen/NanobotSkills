@@ -8,13 +8,9 @@ import pytest
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-SCRIPTS_DIR = REPO_ROOT / "scripts"
-if str(SCRIPTS_DIR) not in sys.path:
-    sys.path.insert(0, str(SCRIPTS_DIR))
-
-from models import RawEventRecord, ThreadContent, ThreadFactTime, ThreadMeta, ThreadPlanTime, ThreadRecord
-from store import TimelineStore
-from timeline_cli import ThreadWritePlan, apply_replay_thread_write_plan
+from scripts.models import RawEventRecord, ThreadContent, ThreadFactTime, ThreadMeta, ThreadPlanTime, ThreadRecord
+from scripts.store import TimelineStore
+from scripts.timeline_cli import ThreadWritePlan, apply_replay_thread_write_plan
 
 
 def _raw_event(event_id: str, *, raw_text: str = "hello") -> RawEventRecord:
