@@ -65,6 +65,9 @@ python scripts/miniflux_http.py show-config
 
 # Preview request without sending
 python scripts/miniflux_http.py request --dry-run ...
+
+# Run tests with isolated temp state
+python scripts/run-tests.py
 ```
 
 Environment: `MINIFLUX_URL`, `MINIFLUX_API_KEY`, `MINIFLUX_USERNAME`, `MINIFLUX_PASSWORD`. Read the full command catalog in `references/command-surface.md`.

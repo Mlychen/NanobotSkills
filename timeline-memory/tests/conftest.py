@@ -19,11 +19,21 @@ CLI_PATH = REPO_ROOT / "scripts" / "timeline_cli.py"
 SCRIPTS_DIR = REPO_ROOT / "scripts"
 DEFAULT_TEST_MODE = "sandbox-safe"
 VALID_TEST_MODES = {"sandbox-safe", "standard"}
+TEST_TMP_ENV_VAR = "TIMELINE_TEST_TMP_ROOT"
 
 if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
 
 import timeline_cli
+from test_runtime import build_test_env
+from test_runtime import resolve_tmp_root
+
+DEFAULT_TEST_TMP_ROOT = resolve_tmp_root(
+    REPO_ROOT,
+    env_var_name=TEST_TMP_ENV_VAR,
+    project_slug="timeline-memory",
+)
+os.environ.setdefault("PYTEST_DEBUG_TEMPROOT", str(DEFAULT_TEST_TMP_ROOT))
 
 
 def _resolve_python_command() -> list[str]:
@@ -43,15 +53,15 @@ class CliRunner:
         self.test_mode = test_mode
 
     def _env(self) -> dict[str, str]:
-        env = dict(os.environ)
-        env["PYTHONIOENCODING"] = "utf-8"
-        env["PYTHONUTF8"] = "1"
-        env["TIMELINE_TEST_MODE"] = self.test_mode
-        env["TIMELINE_TEST_TMP_ROOT"] = str(self.tmp_root)
-        env["TMP"] = str(self.tmp_root)
-        env["TEMP"] = str(self.tmp_root)
-        env["TMPDIR"] = str(self.tmp_root)
-        return env
+        return build_test_env(
+            TEST_TMP_ENV_VAR,
+            self.tmp_root,
+            extra_env={
+                "PYTHONIOENCODING": "utf-8",
+                "PYTHONUTF8": "1",
+                "TIMELINE_TEST_MODE": self.test_mode,
+            },
+        )
 
     def run_process(
         self,
@@ -151,15 +161,7 @@ def _resolve_test_mode() -> str:
 
 
 def _resolve_test_tmp_root(repo_root: Path) -> Path:
-    raw = os.environ.get("TIMELINE_TEST_TMP_ROOT")
-    if raw:
-        path = Path(raw)
-        if not path.is_absolute():
-            path = repo_root / path
-    else:
-        path = repo_root / "tmp" / "test-runtime"
-    path.mkdir(parents=True, exist_ok=True)
-    return path
+    return resolve_tmp_root(repo_root, env_var_name=TEST_TMP_ENV_VAR, project_slug="timeline-memory")
 
 
 @pytest.fixture(scope="session")

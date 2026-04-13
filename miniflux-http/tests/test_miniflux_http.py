@@ -15,6 +15,17 @@ from urllib.error import URLError
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "scripts" / "miniflux_http.py"
+SCRIPTS_DIR = ROOT / "scripts"
+if str(SCRIPTS_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPTS_DIR))
+
+from test_runtime import build_test_env
+from test_runtime import resolve_test_home
+from test_runtime import resolve_tmp_root
+
+
+TEST_TMP_ENV_VAR = "MINIFLUX_TEST_TMP_ROOT"
+TEST_TMP_ROOT = resolve_tmp_root(ROOT, env_var_name=TEST_TMP_ENV_VAR, project_slug="miniflux-http")
 
 
 def load_module():
@@ -59,7 +70,7 @@ class FakeStdout:
 
 class MinifluxHttpCliTests(unittest.TestCase):
     def run_cli(self, *args: str, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
-        cli_env = os.environ.copy()
+        cli_env = build_test_env(TEST_TMP_ENV_VAR, TEST_TMP_ROOT)
         for key in (
             "MINIFLUX_URL",
             "MINIFLUX_API_KEY",
@@ -69,7 +80,7 @@ class MinifluxHttpCliTests(unittest.TestCase):
             cli_env.pop(key, None)
         if env:
             cli_env.update(env)
-        temp_home = str(ROOT / "_test_home")
+        temp_home = str(resolve_test_home(TEST_TMP_ROOT))
         cli_env["HOME"] = temp_home
         cli_env["USERPROFILE"] = temp_home
         return subprocess.run(

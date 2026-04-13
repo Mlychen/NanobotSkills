@@ -1,13 +1,13 @@
 [project]
-name = "timeline-memory-skill"
+name = "miniflux-http-skill"
 version = "0.1.0"
-description = "Standalone timeline-memory skill bundle"
+description = "Standalone miniflux-http skill bundle"
 requires-python = ">=3.11"
 dependencies = []
 
 [project.optional-dependencies]
 dev = [
-    "pytest>=8.2,<9.0",
+    "pytest>=8.2,<10.0",
 ]
 
 [tool.pytest.ini_options]

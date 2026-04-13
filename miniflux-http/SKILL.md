@@ -19,6 +19,7 @@ Use this skill when the work should be expressed as stable Miniflux commands ins
 - Use `python scripts/miniflux_http.py mark-read --category-id 123` to mark all unread entries in a category as read.
 - Use `python scripts/miniflux_http.py mark-read --category "Tech"` to resolve a category by name first, then mark that category as read.
 - Add `--dry-run` to preview the resolved route first.
+- Run tests via `python scripts/run-tests.py`, not bare `pytest`, so temp state stays outside the repo and `cacheprovider` stays disabled.
 - Use [references/command-surface.md](references/command-surface.md) for the canonical command set.
 - Use [references/repo-alignment.md](references/repo-alignment.md) for auth conventions, stable naming, and authoring-time HTTP notes.
 - Use [scripts/miniflux_http.py](scripts/miniflux_http.py) for authenticated one-off requests or request previews instead of rewriting auth code.

@@ -193,10 +193,10 @@ uv run python scripts/run-host-tests.py --mode standard
   - 默认：`sandbox-safe`
   - 可选：`sandbox-safe` / `standard`
 - `TIMELINE_TEST_TMP_ROOT`
-  - 默认：`tmp/test-runtime`
+  - 默认：用户隔离的系统临时目录（Windows 通常在 `%TEMP%\NanobotSkills\timeline-memory\test-runtime`）
   - 可选：显式指定测试运行时根目录（相对路径按 repo root 解析）
 
-清理测试工件（只清理 `tmp/test-runtime`，并报告历史 `pytest-cache-files-*`，不强删）：
+清理测试工件（只清理当前用户的测试运行时目录，并报告历史 `pytest-cache-files-*`，不强删）：
 
 ```bash
 uv run python scripts/clean-test-artifacts.py
@@ -243,8 +243,9 @@ Windows 注意事项：
 - 统一通过 `uv run` 启动脚本与测试，避免 agent 沙箱与系统 Python 环境差异
 - 真实 CLI E2E 依赖 UTF-8 子进程输出
 - 入口脚本会强制注入 `PYTHONIOENCODING=utf-8`、`PYTHONUTF8=1`
-- 入口脚本会固定 `TMP/TEMP/TMPDIR` 到 repo-local `tmp/test-runtime`
+- 入口脚本会固定 `TMP/TEMP/TMPDIR/PYTEST_DEBUG_TEMPROOT` 到用户隔离的本地测试运行时目录
 - 在 `sandbox-safe` 模式下会禁用 `tmpdir` / `cacheprovider`，用于隔离 ACL 异常导致的 `WinError 5`
+- 直接 `pytest` 入口默认也会禁用 `cacheprovider`，避免在 repo 内生成 `.pytest_cache` / `pytest-cache-files-*`
 - 如果历史残留了根目录 `pytest-cache-files-*` 且不可访问，使用 `clean-test-artifacts` 查看报告后按系统权限策略处理
 
 ## 参考资料

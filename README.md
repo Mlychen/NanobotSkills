@@ -32,6 +32,12 @@ This repository stores local skills for AI coding agents (for example, Codex age
 - `ssh-remote-docker-ops`: Remote Docker and Docker Compose operations over SSH, with read-first inspection and service-level management guidance.
 - `miniflux-http`: Miniflux RSS API wrapper with authenticated HTTP operations and E2E testing support.
 
+## Test Hygiene
+
+- Prefer each skill's wrapper test commands over bare `pytest`; the wrappers isolate temp state per user and avoid repo-local pytest cache artifacts.
+- `timeline-memory` uses `scripts/run-host-tests.py` for host/E2E stability runs and disables `cacheprovider` by default even for direct `pytest`.
+- `miniflux-http` uses `scripts/run-tests.py` for pytest runs with isolated temp state.
+
 ## Path Conventions
 
 - Keep path conventions skill-specific.

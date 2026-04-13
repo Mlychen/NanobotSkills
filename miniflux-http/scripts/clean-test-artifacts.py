@@ -6,12 +6,14 @@ from pathlib import Path
 
 from test_runtime import resolve_tmp_root
 
+
 ROOT = Path(__file__).resolve().parents[1]
-TEST_TMP_ENV_VAR = "TIMELINE_TEST_TMP_ROOT"
+TEST_TMP_ENV_VAR = "MINIFLUX_TEST_TMP_ROOT"
+
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Clean timeline-memory test artifacts")
-    parser.add_argument("--tmp-root", help="Override TIMELINE_TEST_TMP_ROOT for cleanup")
+    parser = argparse.ArgumentParser(description="Clean miniflux-http test artifacts")
+    parser.add_argument("--tmp-root", help="Override MINIFLUX_TEST_TMP_ROOT for cleanup")
     return parser.parse_args(argv)
 
 
@@ -31,7 +33,7 @@ def main(argv: list[str] | None = None) -> int:
     tmp_root = resolve_tmp_root(
         ROOT,
         env_var_name=TEST_TMP_ENV_VAR,
-        project_slug="timeline-memory",
+        project_slug="miniflux-http",
         cli_tmp_root=args.tmp_root,
     )
 
@@ -51,6 +53,7 @@ def main(argv: list[str] | None = None) -> int:
 
     for path in sorted(ROOT.glob("pytest-cache-files-*")):
         report_only.append(f"historical pytest temp (report-only): {path}")
+    report_only.append(f"historical pytest cache (report-only): {ROOT / '.pytest_cache'}")
 
     print(f"[clean-test-artifacts] tmp_root={tmp_root}")
     print(f"[clean-test-artifacts] cleaned={len(cleaned)} denied={len(denied)} report_only={len(report_only)}")
