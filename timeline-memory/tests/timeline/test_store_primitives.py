@@ -14,6 +14,7 @@ if str(SCRIPTS_DIR) not in sys.path:
 
 from models import RawEventRecord, ThreadContent, ThreadFactTime, ThreadMeta, ThreadPlanTime, ThreadRecord
 from store import TimelineStore
+from timeline_cli import ThreadWritePlan, apply_replay_thread_write_plan
 
 
 def _raw_event(event_id: str, *, raw_text: str = "hello") -> RawEventRecord:
@@ -293,3 +294,51 @@ def test_replace_snapshot_rejects_temp_payload_with_mismatched_thread_id(scratch
 
     with pytest.raises(ValueError, match="stores thr_other, not thr_target"):
         store.replace_thread_snapshot(thread_id, malicious_temp_path)
+
+
+def test_write_thread_appends_history_before_snapshot(scratch_root: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    store = TimelineStore(scratch_root / "store")
+    current = _thread_record("thr_order", title="before", updated_at="2026-04-06T10:00:00+00:00")
+    target = _thread_record("thr_order", title="after", updated_at="2026-04-06T11:00:00+00:00")
+    calls: list[str] = []
+
+    def fake_write_snapshot(record: ThreadRecord) -> ThreadRecord:
+        calls.append(f"snapshot:{record.title}")
+        return record
+
+    def fake_append_history(record: ThreadRecord) -> None:
+        calls.append(f"history:{record.title}")
+
+    monkeypatch.setattr(store.threads, "write_snapshot", fake_write_snapshot)
+    monkeypatch.setattr(store.threads.history_store, "append", fake_append_history)
+
+    result = store.threads.write_thread(target, current=current, append_history=True)
+
+    assert result.title == "after"
+    assert calls == ["history:before", "snapshot:after"]
+
+
+def test_apply_replay_thread_write_plan_appends_history_before_snapshot(
+    scratch_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = TimelineStore(scratch_root / "store")
+    target = _thread_record("thr_replay_order", title="after", updated_at="2026-04-06T11:00:00+00:00")
+    history = _thread_record("thr_replay_order", title="before", updated_at="2026-04-06T10:00:00+00:00")
+    plan = ThreadWritePlan(target_thread=target, history_entry=history)
+    calls: list[str] = []
+
+    def fake_write_thread_snapshot(record: ThreadRecord) -> ThreadRecord:
+        calls.append(f"snapshot:{record.title}")
+        return record
+
+    def fake_append_thread_history(record: ThreadRecord) -> ThreadRecord:
+        calls.append(f"history:{record.title}")
+        return record
+
+    monkeypatch.setattr(store, "write_thread_snapshot", fake_write_thread_snapshot)
+    monkeypatch.setattr(store, "append_thread_history", fake_append_thread_history)
+
+    result = apply_replay_thread_write_plan(store, plan=plan)
+
+    assert result.title == "after"
+    assert calls == ["history:before", "snapshot:after"]

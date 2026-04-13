@@ -13,6 +13,14 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from errors import (
+    TimelineInvalidArgumentError,
+    TimelineMetadataConflictError,
+    TimelinePartialWriteError,
+    TimelineReadFailedError,
+    TimelineStructuredError,
+    TimelineTurnConflictError,
+)
 SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
@@ -89,12 +97,21 @@ def read_input_json(path: str | None) -> dict:
             return json.loads(Path(path).read_text(encoding="utf-8"))
         return json.load(sys.stdin)
     except json.JSONDecodeError as exc:
-        raise ValueError(
-            f"failed to parse input JSON: {source} line {exc.lineno} column {exc.colno}: {exc.msg}"
+        raise TimelineInvalidArgumentError(
+            f"failed to parse input JSON: {source} line {exc.lineno} column {exc.colno}: {exc.msg}",
+            details={
+                "path": source,
+                "line_no": exc.lineno,
+                "column_no": exc.colno,
+                "reason": exc.msg,
+            },
         ) from exc
     except OSError as exc:
         reason = exc.strerror or str(exc) or exc.__class__.__name__
-        raise ValueError(f"failed to read input JSON: {source}: {reason}") from exc
+        raise TimelineInvalidArgumentError(
+            f"failed to read input JSON: {source}: {reason}",
+            details={"path": source, "reason": reason},
+        ) from exc
 
 
 def emit_json(payload: Any) -> int:
@@ -115,11 +132,11 @@ def _parse_list_threads_limit(raw: str | None) -> int | None:
     try:
         limit = int(raw)
     except ValueError as exc:
-        raise ValueError("list-threads limit must be a positive integer") from exc
+        raise TimelineInvalidArgumentError("list-threads limit must be a positive integer") from exc
     if limit <= 0:
-        raise ValueError("list-threads limit must be a positive integer")
+        raise TimelineInvalidArgumentError("list-threads limit must be a positive integer")
     if limit > MAX_LIST_THREADS_PAGE_SIZE:
-        raise ValueError(f"list-threads limit must be <= {MAX_LIST_THREADS_PAGE_SIZE}")
+        raise TimelineInvalidArgumentError(f"list-threads limit must be <= {MAX_LIST_THREADS_PAGE_SIZE}")
     return limit
 
 
@@ -128,7 +145,7 @@ def _parse_list_threads_timestamp(raw: str | None, *, field_name: str) -> dateti
         return None
     parsed = parse_optional_timestamp(raw, context=field_name, emit_warning=False)
     if parsed is None:
-        raise ValueError(f"list-threads {field_name} must be a valid ISO 8601 timestamp")
+        raise TimelineInvalidArgumentError(f"list-threads {field_name} must be a valid ISO 8601 timestamp")
     return parsed
 
 
@@ -160,9 +177,9 @@ def _decode_list_threads_cursor(raw: str) -> dict[str, Any]:
         decoded = base64.urlsafe_b64decode(f"{raw}{padding}".encode("ascii"))
         payload = json.loads(decoded.decode("utf-8"))
     except Exception as exc:
-        raise ValueError("list-threads cursor is invalid") from exc
+        raise TimelineInvalidArgumentError("list-threads cursor is invalid") from exc
     if not isinstance(payload, dict):
-        raise ValueError("list-threads cursor is invalid")
+        raise TimelineInvalidArgumentError("list-threads cursor is invalid")
     return payload
 
 
@@ -177,16 +194,16 @@ def _thread_cursor_payload(record: ThreadRecord) -> dict[str, Any]:
 def _require_valid_cursor_timestamp(raw: str | None, *, field_name: str, required: bool) -> str | None:
     if raw is None:
         if required:
-            raise ValueError("list-threads cursor is invalid")
+            raise TimelineInvalidArgumentError("list-threads cursor is invalid")
         return None
     if not isinstance(raw, str) or not raw:
-        raise ValueError("list-threads cursor is invalid")
+        raise TimelineInvalidArgumentError("list-threads cursor is invalid")
     if parse_optional_timestamp(
         raw,
         context=f"list-threads cursor {field_name}",
         emit_warning=False,
     ) is None:
-        raise ValueError("list-threads cursor is invalid")
+        raise TimelineInvalidArgumentError("list-threads cursor is invalid")
     return raw
 
 
@@ -197,13 +214,13 @@ def _validate_list_threads_cursor(
 ) -> tuple[tuple[tuple[bool, float], tuple[bool, float], str], dict[str, Any]]:
     payload = _decode_list_threads_cursor(raw)
     if payload.get("v") != 1:
-        raise ValueError("list-threads cursor is invalid")
+        raise TimelineInvalidArgumentError("list-threads cursor is invalid")
     position = payload.get("position")
     if not isinstance(position, dict):
-        raise ValueError("list-threads cursor is invalid")
+        raise TimelineInvalidArgumentError("list-threads cursor is invalid")
     thread_id = position.get("thread_id")
     if not isinstance(thread_id, str) or not thread_id:
-        raise ValueError("list-threads cursor is invalid")
+        raise TimelineInvalidArgumentError("list-threads cursor is invalid")
     updated_at = _require_valid_cursor_timestamp(
         position.get("updated_at"),
         field_name="updated_at",
@@ -231,7 +248,7 @@ def _validate_list_threads_cursor(
     )
     cursor_filters = payload.get("filters")
     if cursor_filters != filters:
-        raise ValueError("list-threads cursor does not match current filters")
+        raise TimelineInvalidArgumentError("list-threads cursor does not match current filters")
     return thread_listing_sort_key(record), payload
 
 
@@ -319,7 +336,7 @@ def extract_timeline_meta(record: RawEventRecord) -> dict[str, Any]:
     payload = record.payload if isinstance(record.payload, dict) else {}
     meta = payload.get(TIMELINE_META_KEY)
     if not isinstance(meta, dict):
-        raise ValueError(f"raw event {record.event_id} is missing {TIMELINE_META_KEY} metadata")
+        raise TimelineMetadataConflictError(f"raw event {record.event_id} is missing {TIMELINE_META_KEY} metadata")
     return dict(meta)
 
 
@@ -375,7 +392,7 @@ def build_thread_record(
 ) -> ThreadRecord:
     thread_input = turn_input.thread
     if thread_input is None:
-        raise ValueError("thread input is required")
+        raise TimelineInvalidArgumentError("thread input is required")
     return ThreadRecord(
         thread_id=thread_id,
         thread_kind=thread_input.thread_kind,
@@ -405,6 +422,21 @@ def thread_ref_event_ids(record: ThreadRecord | None) -> set[str]:
     if record is None:
         return set()
     return {ref.event_id for ref in record.event_refs}
+
+
+def has_contiguous_thread_history(
+    store: TimelineStore,
+    *,
+    thread_id: str,
+    current_thread: ThreadRecord,
+) -> bool:
+    current_revision = current_thread.meta.revision
+    if current_revision <= 1:
+        return True
+    latest_history = store.latest_thread_history(thread_id)
+    if latest_history is None:
+        return False
+    return latest_history.meta.revision == current_revision - 1
 
 
 @dataclass
@@ -479,11 +511,20 @@ def ensure_replay_metadata_matches(
 ) -> str | None:
     meta = extract_timeline_meta(record)
     if meta.get("turn_id") != turn_input.turn_id:
-        raise ValueError(f"turn_id conflict: raw event {record.event_id} does not belong to {turn_input.turn_id}")
+        raise TimelineMetadataConflictError(
+            f"turn_id conflict: raw event {record.event_id} does not belong to {turn_input.turn_id}",
+            details={"turn_id": turn_input.turn_id},
+        )
     if meta.get("fingerprint") != fingerprint:
-        raise ValueError(f"turn_id conflict: different payload already recorded for {turn_input.turn_id}")
+        raise TimelineTurnConflictError(
+            f"turn_id conflict: different payload already recorded for {turn_input.turn_id}",
+            details={"turn_id": turn_input.turn_id},
+        )
     if meta.get("role") != role:
-        raise ValueError(f"turn_id conflict: raw event {record.event_id} has unexpected role metadata")
+        raise TimelineMetadataConflictError(
+            f"turn_id conflict: raw event {record.event_id} has unexpected role metadata",
+            details={"turn_id": turn_input.turn_id},
+        )
     thread_id = meta.get("thread_id")
     return str(thread_id) if thread_id is not None else None
 
@@ -518,7 +559,7 @@ def build_raw_event(
             schema_version=1,
         )
     if turn_input.assistant_text is None:
-        raise ValueError("assistant_text is required for outbound events")
+        raise TimelineInvalidArgumentError("assistant_text is required for outbound events")
     return RawEventRecord(
         event_id=build_event_id(turn_input.turn_id, "outbound"),
         event_type="assistant_response",
@@ -560,9 +601,15 @@ def resolve_replay_raw_state(
     if inbound is None and outbound is None:
         return None
     if inbound is None:
-        raise ValueError(f"turn_id conflict: partial write detected for {turn_input.turn_id} (missing inbound)")
+        raise TimelinePartialWriteError(
+            f"turn_id conflict: partial write detected for {turn_input.turn_id} (missing inbound)",
+            details={"turn_id": turn_input.turn_id},
+        )
     if turn_input.assistant_text is None and outbound is not None:
-        raise ValueError(f"turn_id conflict: partial write detected for {turn_input.turn_id} (unexpected outbound)")
+        raise TimelinePartialWriteError(
+            f"turn_id conflict: partial write detected for {turn_input.turn_id} (unexpected outbound)",
+            details={"turn_id": turn_input.turn_id},
+        )
 
     thread_id = ensure_replay_metadata_matches(
         turn_input=turn_input,
@@ -571,7 +618,10 @@ def resolve_replay_raw_state(
         role="inbound",
     )
     if thread_id not in expected_thread_ids:
-        raise ValueError(f"turn_id conflict: inconsistent thread metadata for {turn_input.turn_id}")
+        raise TimelineMetadataConflictError(
+            f"turn_id conflict: inconsistent thread metadata for {turn_input.turn_id}",
+            details={"turn_id": turn_input.turn_id},
+        )
 
     recorded_ids = [inbound.event_id]
     raw_complete = turn_input.assistant_text is None
@@ -584,7 +634,10 @@ def resolve_replay_raw_state(
             role="outbound",
         )
         if outbound_thread_id != thread_id:
-            raise ValueError(f"turn_id conflict: inconsistent thread metadata for {turn_input.turn_id}")
+            raise TimelineMetadataConflictError(
+                f"turn_id conflict: inconsistent thread metadata for {turn_input.turn_id}",
+                details={"turn_id": turn_input.turn_id},
+            )
         recorded_ids.append(outbound.event_id)
         raw_complete = True
     elif turn_input.assistant_text is not None:
@@ -616,23 +669,34 @@ def resolve_replay_thread_state(
 
     if turn_input.thread is not None:
         if thread_id is None:
-            raise ValueError(f"turn_id conflict: partial write detected for {turn_input.turn_id} (missing thread)")
+            raise TimelinePartialWriteError(
+                f"turn_id conflict: partial write detected for {turn_input.turn_id} (missing thread)",
+                details={"turn_id": turn_input.turn_id},
+            )
         current_thread, baseline_thread, append_history = resolve_replay_baseline(store, thread_id=thread_id)
         baseline_ids = thread_ref_event_ids(baseline_thread)
         required_ids = set(required_event_ids)
         matched_ids = baseline_ids & required_ids
         if matched_ids and len(matched_ids) != len(required_ids):
-            raise ValueError(
+            raise TimelinePartialWriteError(
                 f"turn_id conflict: partial write detected for {turn_input.turn_id} "
-                f"(thread snapshot partially reflects current turn)"
+                f"(thread snapshot partially reflects current turn)",
+                details={"turn_id": turn_input.turn_id},
             )
         if len(matched_ids) == len(required_ids):
             if not raw_complete:
-                raise ValueError(
+                raise TimelinePartialWriteError(
                     f"turn_id conflict: partial write detected for {turn_input.turn_id} "
-                    f"(thread snapshot exists without complete raw events)"
+                    f"(thread snapshot exists without complete raw events)",
+                    details={"turn_id": turn_input.turn_id},
                 )
             if current_thread is not None:
+                if not has_contiguous_thread_history(store, thread_id=thread_id, current_thread=current_thread):
+                    raise TimelinePartialWriteError(
+                        f"turn_id conflict: partial write detected for {turn_input.turn_id} "
+                        f"(thread snapshot exists without the previous revision in history)",
+                        details={"turn_id": turn_input.turn_id, "thread_id": thread_id},
+                    )
                 thread_payload = current_thread.to_dict()
             else:
                 thread_payload = baseline_thread.to_dict()
@@ -729,13 +793,14 @@ def apply_replay_thread_write_plan(
 ) -> ThreadRecord:
     if plan.history_entry is not None:
         store.append_thread_history(plan.history_entry)
-    return store.write_thread_snapshot(plan.target_thread)
+    record = store.write_thread_snapshot(plan.target_thread)
+    return record
 
 
 def _require_txn_str(txn: dict[str, Any], field_name: str) -> str:
     value = txn.get(field_name)
     if not isinstance(value, str) or not value:
-        raise ValueError(f"project-turn txn.{field_name} must be a non-empty string")
+        raise TimelineReadFailedError(f"project-turn txn.{field_name} must be a non-empty string")
     return value
 
 
@@ -743,14 +808,14 @@ def _require_txn_stage(txn: dict[str, Any]) -> str:
     stage = _require_txn_str(txn, "stage")
     if stage not in PROJECT_TURN_TXN_STAGE_ORDER:
         allowed = ", ".join(sorted(PROJECT_TURN_TXN_STAGE_ORDER))
-        raise ValueError(f"project-turn txn.stage must be one of: {allowed}")
+        raise TimelineReadFailedError(f"project-turn txn.stage must be one of: {allowed}")
     return stage
 
 
 def _require_txn_str_list(txn: dict[str, Any], field_name: str) -> list[str]:
     value = txn.get(field_name)
     if not isinstance(value, list) or any(not isinstance(item, str) or not item for item in value):
-        raise ValueError(f"project-turn txn.{field_name} must be a list of non-empty strings")
+        raise TimelineReadFailedError(f"project-turn txn.{field_name} must be a list of non-empty strings")
     return list(value)
 
 
@@ -759,11 +824,11 @@ def _load_txn_thread_record(txn: dict[str, Any], field_name: str) -> ThreadRecor
     if value is None:
         return None
     if not isinstance(value, dict):
-        raise ValueError(f"project-turn txn.{field_name} must be a JSON object")
+        raise TimelineReadFailedError(f"project-turn txn.{field_name} must be a JSON object")
     try:
         return ThreadRecord.from_dict(value)
     except (KeyError, TypeError, ValueError) as exc:
-        raise ValueError(f"failed to load project-turn txn.{field_name}") from exc
+        raise TimelineReadFailedError(f"failed to load project-turn txn.{field_name}") from exc
 
 
 def _thread_payload(record: ThreadRecord | None) -> dict[str, Any] | None:
@@ -883,14 +948,26 @@ def ensure_project_turn_txn_matches(
     thread_id: str | None,
 ) -> list[str]:
     if txn.get("fingerprint") != fingerprint:
-        raise ValueError(f"turn_id conflict: different payload already recorded for {turn_input.turn_id}")
+        raise TimelineTurnConflictError(
+            f"turn_id conflict: different payload already recorded for {turn_input.turn_id}",
+            details={"turn_id": turn_input.turn_id},
+        )
     if txn.get("thread_id") != thread_id:
-        raise ValueError(f"turn_id conflict: inconsistent thread metadata for {turn_input.turn_id}")
+        raise TimelineMetadataConflictError(
+            f"turn_id conflict: inconsistent thread metadata for {turn_input.turn_id}",
+            details={"turn_id": turn_input.turn_id},
+        )
     if bool(txn.get("has_thread")) != (turn_input.thread is not None):
-        raise ValueError(f"turn_id conflict: inconsistent thread metadata for {turn_input.turn_id}")
+        raise TimelineMetadataConflictError(
+            f"turn_id conflict: inconsistent thread metadata for {turn_input.turn_id}",
+            details={"turn_id": turn_input.turn_id},
+        )
     recorded_event_ids = _require_txn_str_list(txn, "required_event_ids")
     if recorded_event_ids != required_turn_event_ids(turn_input):
-        raise ValueError(f"turn_id conflict: inconsistent required event ids for {turn_input.turn_id}")
+        raise TimelineMetadataConflictError(
+            f"turn_id conflict: inconsistent required event ids for {turn_input.turn_id}",
+            details={"turn_id": turn_input.turn_id},
+        )
     return recorded_event_ids
 
 
@@ -933,7 +1010,10 @@ def execute_project_turn_txn(
             source=effective_source,
         )
         if committed_event_ids != recorded_event_ids:
-            raise ValueError(f"turn_id conflict: inconsistent raw event ids for {turn_input.turn_id}")
+            raise TimelineMetadataConflictError(
+                f"turn_id conflict: inconsistent raw event ids for {turn_input.turn_id}",
+                details={"turn_id": turn_input.turn_id},
+            )
         txn = advance_project_turn_txn(store, turn_input.turn_id, txn, stage="raw_committed")
         stage = "raw_committed"
 
@@ -963,7 +1043,10 @@ def execute_project_turn_txn(
 
     if thread_id is not None and PROJECT_TURN_TXN_STAGE_ORDER[stage] < PROJECT_TURN_TXN_STAGE_ORDER["snapshot_committed"]:
         if target_thread is None:
-            raise ValueError(f"project-turn txn.target_snapshot is missing for {turn_input.turn_id}")
+            raise TimelinePartialWriteError(
+                f"project-turn txn.target_snapshot is missing for {turn_input.turn_id}",
+                details={"turn_id": turn_input.turn_id},
+            )
         store.write_thread_snapshot(target_thread)
         txn = advance_project_turn_txn(store, turn_input.turn_id, txn, stage="snapshot_committed")
         stage = "snapshot_committed"
@@ -1056,11 +1139,11 @@ def recover_replay_thread_payload(
     if recovery.thread_action == "restore_snapshot":
         baseline_thread = recovery.baseline_thread
         if baseline_thread is None:
-            raise ValueError("replay recovery baseline thread is required for restore_snapshot")
+            raise TimelinePartialWriteError("replay recovery baseline thread is required for restore_snapshot")
         return store.write_thread_snapshot(baseline_thread).to_dict()
     if recovery.thread_action == "repair_thread":
         if recovery.thread_id is None:
-            raise ValueError("replay recovery thread_id is required for repair_thread")
+            raise TimelinePartialWriteError("replay recovery thread_id is required for repair_thread")
         thread_plan = build_thread_write_plan(
             store,
             turn_input=turn_input,
@@ -1131,7 +1214,7 @@ def cmd_list_threads(args: argparse.Namespace) -> int:
         and last_event_at_or_before is not None
         and last_event_at_or_after > last_event_at_or_before
     ):
-        raise ValueError("list-threads last_event_at_or_after must be <= last_event_at_or_before")
+        raise TimelineInvalidArgumentError("list-threads last_event_at_or_after must be <= last_event_at_or_before")
     records = store.list_threads(
         thread_kind=args.thread_kind,
         status=args.status,
@@ -1163,7 +1246,12 @@ def cmd_list_thread_history(args: argparse.Namespace) -> int:
 
 def cmd_project_turn(args: argparse.Namespace) -> int:
     store = build_store(args)
-    turn_input = ProjectTurnInput.from_dict(read_input_json(args.input))
+    try:
+        turn_input = ProjectTurnInput.from_dict(read_input_json(args.input))
+    except TimelineStructuredError:
+        raise
+    except ValueError as exc:
+        raise TimelineInvalidArgumentError(str(exc)) from exc
     effective_source = resolve_effective_source(turn_input)
     fingerprint = turn_input.fingerprint()
     thread_id = resolve_thread_id(turn_input)
@@ -1322,6 +1410,14 @@ def _is_invalid_argument_message(message: str) -> bool:
 def classify_cli_error(exc: Exception) -> TimelineCliError:
     if isinstance(exc, TimelineCliError):
         return exc
+
+    if isinstance(exc, TimelineStructuredError):
+        return TimelineCliError(
+            code=exc.code,
+            category=exc.category,
+            message=str(exc) or exc.__class__.__name__,
+            details=dict(exc.details),
+        )
 
     message = str(exc) or exc.__class__.__name__
 

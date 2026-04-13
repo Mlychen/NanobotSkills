@@ -1213,6 +1213,46 @@ def test_existing_thread_replay_deduplicates_history_after_append_only_crash(cli
     ]
 
 
+def test_existing_thread_replay_rejects_snapshot_without_previous_revision_in_history(
+    cli_runner, scratch_root: Path
+) -> None:
+    store_root = scratch_root / "repair-existing-history-gap"
+    template_store = scratch_root / "repair-existing-history-gap-template"
+    first_payload = {
+        "turn_id": "agent:e2e:repair-gap:0001",
+        "user_text": "第一次记录线程。",
+        "assistant_text": "已记录第一次。",
+        "thread": {"thread_id": "thr_history_gap", "title": "first", "status": "planned"},
+    }
+    second_payload = {
+        "turn_id": "agent:e2e:repair-gap:0002",
+        "user_text": "第二次更新线程。",
+        "assistant_text": "已记录第二次。",
+        "thread": {"thread_id": "thr_history_gap", "title": "second", "status": "planned"},
+    }
+
+    cli_runner.run_json(store_root, "project-turn", payload=first_payload)
+    cli_runner.run_json(template_store, "project-turn", payload=first_payload)
+    cli_runner.run_json(template_store, "project-turn", payload=second_payload)
+
+    raw_path = store_root / "raw_events.jsonl"
+    for line in _raw_event_lines(template_store):
+        if second_payload["turn_id"] not in line:
+            continue
+        with open(raw_path, "a", encoding="utf-8") as handle:
+            handle.write(f"{line}\n")
+
+    corrupted_snapshot = _read_thread_snapshot(template_store, "thr_history_gap")
+    _write_thread_snapshot(store_root, "thr_history_gap", corrupted_snapshot)
+
+    error = cli_runner.expect_failure_json(store_root, "project-turn", payload=second_payload)
+    history = cli_runner.run_json(store_root, "list-thread-history", args=["--thread-id", "thr_history_gap"])
+
+    assert error["error"]["code"] == "TM_PARTIAL_WRITE"
+    assert "previous revision in history" in error["error"]["message"]
+    assert history == []
+
+
 def test_missing_snapshot_replay_preserves_multiturn_thread_state(cli_runner, scratch_root: Path) -> None:
     store_root = scratch_root / "repair-multiturn-snapshot"
     first_payload = {

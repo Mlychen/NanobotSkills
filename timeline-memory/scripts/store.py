@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, BinaryIO, Iterator
 
+from errors import TimelineInvalidArgumentError, TimelineReadFailedError, TimelineTurnConflictError
 from models import RawEventRecord, ThreadMeta, ThreadRecord
 from time_utils import parse_optional_timestamp, timestamp_sort_key
 
@@ -90,15 +91,16 @@ def normalize_jsonl_read_mode(read_mode: str) -> str:
     normalized = read_mode.strip().lower()
     if normalized not in VALID_JSONL_READ_MODES:
         allowed = ", ".join(sorted(VALID_JSONL_READ_MODES))
-        raise ValueError(f"unsupported read mode: {read_mode!r}; expected one of: {allowed}")
+        raise TimelineInvalidArgumentError(f"unsupported read mode: {read_mode!r}; expected one of: {allowed}")
     return normalized
 
 
 def _raise_jsonl_read_error(path: Path, *, line_no: int, reason: str, cause: Exception | None = None) -> None:
     message = f"failed to read JSONL: {path} line {line_no}: {reason}"
+    details = {"path": str(path), "line_no": line_no, "reason": reason}
     if cause is None:
-        raise ValueError(message)
-    raise ValueError(message) from cause
+        raise TimelineReadFailedError(message, details=details)
+    raise TimelineReadFailedError(message, details=details) from cause
 
 
 def _require_mapping(payload: Any, name: str) -> dict[str, Any]:
@@ -173,9 +175,9 @@ def _read_env_float(name: str, default: float) -> float:
     try:
         value = float(raw)
     except ValueError as exc:
-        raise ValueError(f"{name} must be a non-negative number") from exc
+        raise TimelineInvalidArgumentError(f"{name} must be a non-negative number") from exc
     if value < 0:
-        raise ValueError(f"{name} must be a non-negative number")
+        raise TimelineInvalidArgumentError(f"{name} must be a non-negative number")
     return value
 
 
@@ -349,7 +351,7 @@ class RawEventStore:
             if existing_record is None:
                 continue
             if existing_record.to_dict() != record.to_dict():
-                raise ValueError(f"raw event conflict: different payload already exists: {record.event_id}")
+                raise TimelineTurnConflictError(f"raw event conflict: different payload already exists: {record.event_id}")
         missing_records = [record for record in records if record.event_id not in existing]
         if not missing_records:
             return
@@ -367,7 +369,10 @@ class RawEventStore:
             try:
                 return RawEventRecord.from_dict(payload)
             except (KeyError, TypeError, ValueError) as exc:
-                raise ValueError(f"failed to load raw event: {event_id}") from exc
+                raise TimelineReadFailedError(
+                    f"failed to load raw event: {event_id}",
+                    details={"event_id": event_id},
+                ) from exc
         return None
 
     def _existing_records(self, event_ids: set[str]) -> dict[str, RawEventRecord]:
@@ -381,7 +386,10 @@ class RawEventStore:
             try:
                 existing[event_id] = RawEventRecord.from_dict(payload)
             except (KeyError, TypeError, ValueError) as exc:
-                raise ValueError(f"failed to load raw event: {event_id}") from exc
+                raise TimelineReadFailedError(
+                    f"failed to load raw event: {event_id}",
+                    details={"event_id": event_id},
+                ) from exc
         return existing
 
 
@@ -399,11 +407,17 @@ class ProjectTurnTxnStore:
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as exc:
-            raise ValueError(f"failed to load project-turn txn: {path.name}") from exc
+            raise TimelineReadFailedError(
+                f"failed to load project-turn txn: {path.name}",
+                details={"path": path.name},
+            ) from exc
         try:
             return _validate_project_turn_txn(turn_id, payload)
         except ValueError as exc:
-            raise ValueError(f"failed to load project-turn txn: {path.name}") from exc
+            raise TimelineReadFailedError(
+                f"failed to load project-turn txn: {path.name}",
+                details={"path": path.name},
+            ) from exc
 
     def write(self, turn_id: str, payload: dict[str, Any]) -> dict[str, Any]:
         normalized = _validate_project_turn_txn(turn_id, payload)
@@ -418,7 +432,7 @@ class ProjectTurnTxnStore:
         if existing is None:
             raise ValueError(f"project-turn txn disappeared during write: {turn_id}")
         if existing["fingerprint"] != normalized["fingerprint"]:
-            raise ValueError(
+            raise TimelineTurnConflictError(
                 f"project-turn txn conflict: different fingerprint already exists for {turn_id}"
             )
         merged = _validate_project_turn_txn(turn_id, _merge_project_turn_txn(existing, normalized))
@@ -459,11 +473,17 @@ class ThreadHistoryStore:
             try:
                 records.append(ThreadRecord.from_dict(payload))
             except (KeyError, TypeError, ValueError) as exc:
-                raise ValueError(f"failed to load thread history: {path.name}") from exc
+                raise TimelineReadFailedError(
+                    f"failed to load thread history: {path.name}",
+                    details={"path": path.name},
+                ) from exc
 
         mismatched = sorted({record.thread_id for record in records if record.thread_id != thread_id})
         if mismatched:
-            raise ValueError(f"thread history path mismatch: {path.name} mixes {', '.join(mismatched)} with {thread_id}")
+            raise TimelineReadFailedError(
+                f"thread history path mismatch: {path.name} mixes {', '.join(mismatched)} with {thread_id}",
+                details={"path": path.name, "thread_id": thread_id},
+            )
 
         return records
 
@@ -492,10 +512,16 @@ class ThreadStore:
                 raise ValueError("thread snapshot must be a JSON object")
             record = ThreadRecord.from_dict(payload)
         except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
-            raise ValueError(f"failed to load thread snapshot: {path.name}") from exc
+            raise TimelineReadFailedError(
+                f"failed to load thread snapshot: {path.name}",
+                details={"path": path.name},
+            ) from exc
 
         if record.thread_id != thread_id:
-            raise ValueError(f"thread snapshot path mismatch: {path.name} stores {record.thread_id}, not {thread_id}")
+            raise TimelineReadFailedError(
+                f"thread snapshot path mismatch: {path.name} stores {record.thread_id}, not {thread_id}",
+                details={"path": path.name, "thread_id": thread_id},
+            )
         return record
 
     def upsert_thread(self, record: ThreadRecord) -> ThreadRecord:
@@ -528,9 +554,9 @@ class ThreadStore:
     def replace_snapshot(self, thread_id: str, temp_path: Path) -> Path:
         path = self.path_for(thread_id)
         if temp_path.parent != path.parent:
-            raise ValueError("snapshot temp file must be in the same directory as the target snapshot")
+            raise TimelineReadFailedError("snapshot temp file must be in the same directory as the target snapshot")
         if not temp_path.name.startswith(f"{path.name}.") or temp_path.suffix != ".tmp":
-            raise ValueError("snapshot temp file name does not match the target snapshot")
+            raise TimelineReadFailedError("snapshot temp file name does not match the target snapshot")
         record = self._load_thread(temp_path, thread_id=thread_id)
         try:
             temp_path.replace(path)
@@ -539,7 +565,10 @@ class ThreadStore:
                 temp_path.unlink(missing_ok=True)
             raise
         if record.thread_id != thread_id:
-            raise ValueError(f"thread snapshot temp mismatch: {temp_path.name} stores {record.thread_id}")
+            raise TimelineReadFailedError(
+                f"thread snapshot temp mismatch: {temp_path.name} stores {record.thread_id}",
+                details={"path": temp_path.name, "thread_id": thread_id},
+            )
         return path
 
     def list_threads(
@@ -559,10 +588,16 @@ class ThreadStore:
                     raise ValueError("thread snapshot must be a JSON object")
                 record = ThreadRecord.from_dict(payload)
             except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
-                raise ValueError(f"failed to load thread snapshot: {path.name}") from exc
+                raise TimelineReadFailedError(
+                    f"failed to load thread snapshot: {path.name}",
+                    details={"path": path.name},
+                ) from exc
             expected_name = f"{encode_thread_storage_key(record.thread_id)}.json"
             if path.name != expected_name:
-                raise ValueError(f"thread snapshot path mismatch: {path.name} stores {record.thread_id}")
+                raise TimelineReadFailedError(
+                    f"thread snapshot path mismatch: {path.name} stores {record.thread_id}",
+                    details={"path": path.name, "thread_id": record.thread_id},
+                )
             if thread_kind is not None and record.thread_kind != thread_kind:
                 continue
             if status is not None and record.status != status:
