@@ -1,5 +1,15 @@
 # Timeline Memory Schema
 
+本文档是当前稳定公开 contract 的规范源。
+
+如果你想看：
+
+- 命令怎么调用
+- 测试入口怎么跑
+- 什么时候使用这个 skill
+
+请先读上一级的 `README.md` 和 `SKILL.md`。
+
 ## Public CLI Contract
 
 公开 CLI 只保留 4 个命令：

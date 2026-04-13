@@ -54,7 +54,8 @@
 ### 6. 文档组织分裂，规范源不清晰
 
 - 风险是否真实：`是`
-- 紧急度：`低到中`
+- 当前状态：`主入口已缓解`
+- 紧急度：`低`
 - 影响面：`中`
 - 详情见：[risk-06-documentation-fragmentation.md](./risk-06-documentation-fragmentation.md)
 
