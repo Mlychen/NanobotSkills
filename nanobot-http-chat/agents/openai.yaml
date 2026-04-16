@@ -1,0 +1,4 @@
+interface:
+  display_name: "Nanobot HTTP Chat"
+  short_description: "Talk to a reachable nanobot instance over HTTP"
+  default_prompt: "Use $nanobot-http-chat to send the next prompt to a reachable nanobot HTTP endpoint with an explicit base_url and session_id, then return only nanobot's reply text."
