@@ -15,8 +15,8 @@
   - 偏过程文档，不作为新增设计的唯一规范源。
 
 - `project-turn-proxy-design.md`
-  - 面向未来的设计文档位，用于承接后续 `project-turn proxy` 方向的方案。
-  - 当前仓库尚未落这份文件；开始推进该方向时，再补文档并从这里进入。
+  - `project-turn proxy` 的正式设计草案。
+  - 当前用于定义代理层的输入约定、职责边界与最小链路。
 
 - `risks/README.md`
   - 当前已确认风险与分项风险文档入口。
@@ -28,5 +28,5 @@
 1. 先回到上一级读 `../README.md`
 2. 需要确认稳定 contract 时读 `schema.md`
 3. 需要看里程碑状态和历史决策时读 `design-milestones-status-and-acceptance.md`
-4. 需要推进未来 proxy 设计时，补 `project-turn-proxy-design.md` 后再从这里进入
+4. 需要推进 `project-turn proxy` 设计时，读 `project-turn-proxy-design.md`
 5. 排期或缺陷治理时，再看 `risks/README.md`
