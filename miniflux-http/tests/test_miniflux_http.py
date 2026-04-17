@@ -203,7 +203,10 @@ class MinifluxHttpCliTests(unittest.TestCase):
         )
 
         self.assertEqual(result.returncode, 2)
-        self.assertIn("one of the arguments --all --category-id --category is required", result.stderr)
+        self.assertIn(
+            "one of the arguments --all --feed-id --feed --category-id --category is required",
+            result.stderr,
+        )
 
 
 class MinifluxHttpRequestErrorTests(unittest.TestCase):
@@ -402,6 +405,8 @@ class MinifluxHttpMarkReadTests(unittest.TestCase):
         self,
         *,
         all_entries: bool = True,
+        feed_id: int | None = None,
+        feed: str | None = None,
         category_id: int | None = None,
         category: str | None = None,
         user_id: int | None = None,
@@ -415,6 +420,8 @@ class MinifluxHttpMarkReadTests(unittest.TestCase):
             password=None,
             timeout=30.0,
             all=all_entries,
+            feed_id=feed_id,
+            feed=feed,
             category_id=category_id,
             category=category,
             user_id=user_id,
@@ -450,6 +457,52 @@ class MinifluxHttpMarkReadTests(unittest.TestCase):
         self.assertEqual(payload["method"], "PUT")
         self.assertEqual(
             payload["url"], "http://example.test/v1/categories/12/mark-all-as-read"
+        )
+        self.assertFalse(payload["has_body"])
+
+    def test_mark_read_feed_dry_run_targets_feed_route(self) -> None:
+        stdout = StringIO()
+        args = self.make_args(all_entries=False, feed_id=22, dry_run=True)
+
+        with patch.object(sys, "stdout", stdout):
+            code = MODULE.command_mark_read(args)
+
+        self.assertEqual(code, 0)
+        payload = json.loads(stdout.getvalue())
+        self.assertEqual(payload["method"], "PUT")
+        self.assertEqual(
+            payload["url"], "http://example.test/v1/feeds/22/mark-all-as-read"
+        )
+        self.assertFalse(payload["has_body"])
+
+    def test_mark_read_feed_name_dry_run_resolves_feed_id(self) -> None:
+        stdout = StringIO()
+        args = self.make_args(all_entries=False, feed="Tech Daily", dry_run=True)
+        feeds_response = DummyHTTPResponse(
+            json.dumps(
+                [
+                    {"id": 22, "title": "Tech Daily"},
+                    {"id": 23, "title": "World News"},
+                ]
+            ).encode()
+        )
+        requests: list[object] = []
+
+        def fake_urlopen(request, timeout):  # noqa: ANN001
+            requests.append(request)
+            return feeds_response
+
+        with patch.object(MODULE, "urlopen", side_effect=fake_urlopen):
+            with patch.object(sys, "stdout", stdout):
+                code = MODULE.command_mark_read(args)
+
+        self.assertEqual(code, 0)
+        self.assertEqual(len(requests), 1)
+        self.assertEqual(requests[0].full_url, "http://example.test/v1/feeds")
+        payload = json.loads(stdout.getvalue())
+        self.assertEqual(payload["method"], "PUT")
+        self.assertEqual(
+            payload["url"], "http://example.test/v1/feeds/22/mark-all-as-read"
         )
         self.assertFalse(payload["has_body"])
 
@@ -529,6 +582,26 @@ class MinifluxHttpMarkReadTests(unittest.TestCase):
         )
         self.assertEqual(requests[0].method, "PUT")
 
+    def test_mark_read_feed_does_not_resolve_user(self) -> None:
+        args = self.make_args(all_entries=False, feed_id=22)
+        feed_response = DummyHTTPResponse(b"")
+        requests: list[object] = []
+
+        def fake_urlopen(request, timeout):  # noqa: ANN001
+            requests.append(request)
+            return feed_response
+
+        with patch.object(MODULE, "urlopen", side_effect=fake_urlopen):
+            code = MODULE.command_mark_read(args)
+
+        self.assertEqual(code, 0)
+        self.assertEqual(len(requests), 1)
+        self.assertEqual(
+            requests[0].full_url,
+            "http://example.test/v1/feeds/22/mark-all-as-read",
+        )
+        self.assertEqual(requests[0].method, "PUT")
+
     def test_mark_read_category_name_is_case_insensitive(self) -> None:
         args = self.make_args(all_entries=False, category="tech")
         categories_response = DummyHTTPResponse(
@@ -560,6 +633,37 @@ class MinifluxHttpMarkReadTests(unittest.TestCase):
         )
         self.assertEqual(requests[1].method, "PUT")
 
+    def test_mark_read_feed_name_is_case_insensitive(self) -> None:
+        args = self.make_args(all_entries=False, feed="tech daily")
+        feeds_response = DummyHTTPResponse(
+            json.dumps(
+                [
+                    {"id": 22, "title": "Tech Daily"},
+                    {"id": 23, "title": "World News"},
+                ]
+            ).encode()
+        )
+        feed_response = DummyHTTPResponse(b"")
+        requests: list[object] = []
+
+        def fake_urlopen(request, timeout):  # noqa: ANN001
+            requests.append(request)
+            if len(requests) == 1:
+                return feeds_response
+            return feed_response
+
+        with patch.object(MODULE, "urlopen", side_effect=fake_urlopen):
+            code = MODULE.command_mark_read(args)
+
+        self.assertEqual(code, 0)
+        self.assertEqual(len(requests), 2)
+        self.assertEqual(requests[0].full_url, "http://example.test/v1/feeds")
+        self.assertEqual(
+            requests[1].full_url,
+            "http://example.test/v1/feeds/22/mark-all-as-read",
+        )
+        self.assertEqual(requests[1].method, "PUT")
+
     def test_mark_read_resolve_user_requires_integer_id(self) -> None:
         args = self.make_args()
 
@@ -585,6 +689,26 @@ class MinifluxHttpMarkReadTests(unittest.TestCase):
 
         with patch.object(MODULE, "urlopen", return_value=DummyHTTPResponse(body)):
             with self.assertRaisesRegex(MODULE.CliUsageError, "Category name is ambiguous: tech"):
+                MODULE.command_mark_read(args)
+
+    def test_mark_read_feed_name_requires_match(self) -> None:
+        args = self.make_args(all_entries=False, feed="Missing")
+
+        with patch.object(MODULE, "urlopen", return_value=DummyHTTPResponse(b"[]")):
+            with self.assertRaisesRegex(MODULE.CliUsageError, "Feed not found: Missing"):
+                MODULE.command_mark_read(args)
+
+    def test_mark_read_feed_name_rejects_ambiguous_match(self) -> None:
+        args = self.make_args(all_entries=False, feed="tech daily")
+        body = json.dumps(
+            [
+                {"id": 22, "title": "Tech Daily"},
+                {"id": 23, "title": "TECH DAILY"},
+            ]
+        ).encode()
+
+        with patch.object(MODULE, "urlopen", return_value=DummyHTTPResponse(body)):
+            with self.assertRaisesRegex(MODULE.CliUsageError, "Feed name is ambiguous: tech daily"):
                 MODULE.command_mark_read(args)
 
     def test_main_mark_read_all_lookup_network_failure_returns_request_error_exit_code(self) -> None:
@@ -634,6 +758,34 @@ class MinifluxHttpMarkReadTests(unittest.TestCase):
 
         self.assertEqual(code, 1)
         self.assertIn("Unable to resolve category from /v1/categories: HTTP 500", stderr.getvalue())
+
+    def test_main_mark_read_feed_lookup_http_failure_returns_request_error_exit_code(self) -> None:
+        stderr = StringIO()
+        argv = [
+            str(SCRIPT),
+            "mark-read",
+            "--base-url",
+            "http://example.test",
+            "--api-key",
+            "secret",
+            "--feed",
+            "Tech Daily",
+        ]
+        error = HTTPError(
+            url="http://example.test/v1/feeds",
+            code=500,
+            msg="Internal Server Error",
+            hdrs=None,
+            fp=DummyHTTPResponse(b""),
+        )
+
+        with patch.object(sys, "argv", argv):
+            with patch.object(MODULE, "urlopen", side_effect=error):
+                with patch.object(sys, "stderr", stderr):
+                    code = MODULE.main()
+
+        self.assertEqual(code, 1)
+        self.assertIn("Unable to resolve feed from /v1/feeds: HTTP 500", stderr.getvalue())
 
 
 if __name__ == "__main__":

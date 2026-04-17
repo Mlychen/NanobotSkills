@@ -129,6 +129,15 @@ def add_mark_read_arguments(parser: argparse.ArgumentParser) -> None:
         help="Mark all unread entries for the authenticated user as read.",
     )
     scope_group.add_argument(
+        "--feed-id",
+        type=int,
+        help="Mark all unread entries in the given feed as read.",
+    )
+    scope_group.add_argument(
+        "--feed",
+        help="Mark all unread entries in the named feed as read.",
+    )
+    scope_group.add_argument(
         "--category-id",
         type=int,
         help="Mark all unread entries in the given category as read.",
@@ -412,6 +421,62 @@ def resolve_category_id(
     raise CliUsageError(f"Category not found: {category_name}")
 
 
+def resolve_feed_id(
+    config: dict[str, object], headers: dict[str, str], timeout: float, feed_name: str
+) -> int:
+    url = build_url(str(config["base_url"]), "/v1/feeds", [])
+    request = Request(
+        url=url,
+        headers=headers,
+        method="GET",
+    )
+    try:
+        with urlopen(request, timeout=timeout) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except HTTPError as exc:
+        raise RequestFailureError(
+            f"Unable to resolve feed from /v1/feeds: HTTP {exc.code}"
+        ) from exc
+    except URLError as exc:
+        raise RequestFailureError(
+            f"Unable to resolve feed from /v1/feeds: {exc}"
+        ) from exc
+    except json.JSONDecodeError as exc:
+        raise RequestFailureError(
+            "Unable to resolve feed from /v1/feeds: invalid JSON response"
+        ) from exc
+
+    if not isinstance(payload, list):
+        raise RequestFailureError(
+            "Unable to resolve feed from /v1/feeds: expected feed list"
+        )
+
+    exact_matches = [
+        item for item in payload
+        if isinstance(item, dict) and item.get("title") == feed_name and isinstance(item.get("id"), int)
+    ]
+    if len(exact_matches) == 1:
+        return int(exact_matches[0]["id"])
+    if len(exact_matches) > 1:
+        raise CliUsageError(f"Feed name is ambiguous: {feed_name}")
+
+    normalized = feed_name.casefold()
+    folded_matches = [
+        item for item in payload
+        if (
+            isinstance(item, dict)
+            and isinstance(item.get("title"), str)
+            and item["title"].casefold() == normalized
+            and isinstance(item.get("id"), int)
+        )
+    ]
+    if len(folded_matches) == 1:
+        return int(folded_matches[0]["id"])
+    if len(folded_matches) > 1:
+        raise CliUsageError(f"Feed name is ambiguous: {feed_name}")
+    raise CliUsageError(f"Feed not found: {feed_name}")
+
+
 def command_show_config(args: argparse.Namespace) -> int:
     config = inspect_config(args)
     payload = {
@@ -500,7 +565,20 @@ def command_request(args: argparse.Namespace) -> int:
 def command_mark_read(args: argparse.Namespace) -> int:
     config = resolve_request_config(args)
     headers = build_headers(config, [])
-    if args.category_id is not None:
+    if args.feed_id is not None:
+        url = build_url(
+            str(config["base_url"]),
+            f"/v1/feeds/{args.feed_id}/mark-all-as-read",
+            [],
+        )
+    elif args.feed is not None:
+        feed_id = resolve_feed_id(config, headers, args.timeout, args.feed)
+        url = build_url(
+            str(config["base_url"]),
+            f"/v1/feeds/{feed_id}/mark-all-as-read",
+            [],
+        )
+    elif args.category_id is not None:
         url = build_url(
             str(config["base_url"]),
             f"/v1/categories/{args.category_id}/mark-all-as-read",
